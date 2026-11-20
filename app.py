@@ -75,6 +75,7 @@ HTML = r"""<!DOCTYPE html>
     <label><input type="radio" name="assetType" value="video"> 動画（そのままつなぐ）</label>
   </div>
   <img id="thumbPreview" class="thumb hidden">
+  <video id="thumbVideoPreview" class="thumb hidden" controls muted playsinline></video>
 </div>
 
 <div class="card"><h2><span class="step">2.</span> 登壇者に代わる所を探す</h2>
@@ -148,8 +149,16 @@ bindDrop('thumbDrop','thumbFile', f=>{
   const isVideo = (f.type||'').startsWith('video');
   document.querySelector(`input[name=assetType][value="${isVideo?'video':'image'}"]`).checked=true;
   syncAssetType();
-  const im=$('thumbPreview');
-  if(isVideo){ im.classList.add('hidden'); } else { im.src=URL.createObjectURL(f); im.classList.remove('hidden'); }
+  const im=$('thumbPreview'), vm=$('thumbVideoPreview');
+  if(isVideo){
+    im.classList.add('hidden');
+    vm.src=URL.createObjectURL(f); vm.classList.remove('hidden');
+    vm.onloadedmetadata=()=>{ if(document.querySelector('input[name=assetType]:checked').value==='video')
+      $('assetNote').textContent=`動画素材はそのままの長さ（${vm.duration.toFixed(1)}秒）で頭とお尻につなぎます`; };
+  } else {
+    vm.classList.add('hidden'); vm.removeAttribute('src');
+    im.src=URL.createObjectURL(f); im.classList.remove('hidden');
+  }
   $('runBtn').disabled = !videoFile;
 });
 bindDrop('transcriptDrop','transcriptFile', f=>{
