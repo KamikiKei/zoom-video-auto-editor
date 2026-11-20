@@ -1,0 +1,51 @@
+@echo off
+chcp 65001 >nul
+cd /d %~dp0
+echo ========================================
+echo  Zoom動画 かんたん編集（ローカル版）
+echo ========================================
+echo.
+
+where python >nul 2>nul
+if errorlevel 1 (
+  echo [不足] Python が見つかりません。
+  echo 下のコマンドをコマンドプロンプトで実行して入れてから、
+  echo もう一度このファイルをダブルクリックしてください。
+  echo.
+  echo   winget install Python.Python.3.12
+  echo.
+  pause
+  exit /b 1
+)
+
+where ffmpeg >nul 2>nul
+if errorlevel 1 (
+  echo [不足] ffmpeg が見つかりません。
+  echo 下のコマンドをコマンドプロンプトで実行して入れてから、
+  echo もう一度このファイルをダブルクリックしてください。
+  echo.
+  echo   winget install Gyan.FFmpeg
+  echo.
+  pause
+  exit /b 1
+)
+
+if not exist .venv\Scripts\python.exe (
+  echo 初回セットアップ中です。少し時間がかかります...
+  python -m venv .venv
+)
+
+.venv\Scripts\python -c "import numpy, scipy" 2>nul
+if errorlevel 1 (
+  echo 必要な部品をインストールしています...
+  .venv\Scripts\python -m pip install numpy scipy
+)
+
+echo.
+echo 起動します。ブラウザが自動で開きます。
+echo 終わったら、この黒い画面を閉じてください。
+echo.
+timeout /t 2 /nobreak >nul
+start "" http://localhost:8765
+.venv\Scripts\python app.py
+pause
