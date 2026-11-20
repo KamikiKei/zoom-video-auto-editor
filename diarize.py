@@ -135,18 +135,7 @@ def smooth(labels, size=3):
     return out
 
 
-def diarize(video: Path, n_speakers=2, min_segment=1.5):
-    fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="diarize_")
-    os.close(fd)
-    tmp_wav = Path(tmp_name)
-    extract_wav(video, tmp_wav)
-    sr, data = wavfile.read(tmp_wav)
-    tmp_wav.unlink(missing_ok=True)
-    if data.dtype == np.int16:
-        signal = data.astype(np.float64) / 32768.0
-    else:
-        signal = data.astype(np.float64)
-
+def _segments_lite(signal, sr, n_speakers=2, min_segment=1.5):
     times, feats, rms = mfcc_features(signal, sr)
     if len(times) == 0:
         raise RuntimeError("音声が短すぎます")
@@ -203,20 +192,24 @@ def diarize(video: Path, n_speakers=2, min_segment=1.5):
         else:
             final.append(s)
 
+    return final
+
+
+def _summarize(segments):
     # 話者ごとの合計時間
     totals = {}
-    for a, b, lab in final:
+    for a, b, lab in segments:
         totals[lab] = totals.get(lab, 0) + (b - a)
     main_speaker = max(totals, key=totals.get)
 
     # 提案: 本編話者の最初の「5秒以上続く」区間の開始
     suggestion = None
-    for a, b, lab in final:
+    for a, b, lab in segments:
         if lab == main_speaker and (b - a) >= 5:
             suggestion = a
             break
     if suggestion is None:
-        for a, b, lab in final:
+        for a, b, lab in segments:
             if lab == main_speaker:
                 suggestion = a
                 break
@@ -227,9 +220,92 @@ def diarize(video: Path, n_speakers=2, min_segment=1.5):
         "suggested_trim_start": round(float(suggestion), 1) if suggestion is not None else None,
         "segments": [
             {"start": round(a, 1), "end": round(b, 1), "speaker": int(lab)}
-            for a, b, lab in final
+            for a, b, lab in segments
         ],
     }
+
+
+# --- 高精度バックエンド (sherpa-onnx: pyannote segmentation + 話者埋め込み) ---
+_MODELS_DIR = Path(__file__).parent / "models"
+_SEG_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+_EMB_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+_SEG_MODEL = _MODELS_DIR / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
+_EMB_MODEL = _MODELS_DIR / "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+
+
+def _ensure_models():
+    if _SEG_MODEL.exists() and _EMB_MODEL.exists():
+        return
+    import io
+    import tarfile
+    import urllib.request
+    _MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    if not _EMB_MODEL.exists():
+        print("話者分離モデルをダウンロード中... (話者埋め込み, 約40MB)")
+        urllib.request.urlretrieve(_EMB_URL, _EMB_MODEL)
+    if not _SEG_MODEL.exists():
+        print("話者分離モデルをダウンロード中... (セグメンテーション, 約7MB)")
+        data = urllib.request.urlopen(_SEG_URL).read()
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:bz2") as tf:
+            tf.extractall(_MODELS_DIR)
+
+
+def _segments_sherpa(signal, n_speakers=2):
+    import sherpa_onnx
+    _ensure_models()
+    config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                model=str(_SEG_MODEL))
+        ),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(_EMB_MODEL)),
+        clustering=sherpa_onnx.FastClusteringConfig(
+            num_clusters=n_speakers, threshold=0.5),
+        min_duration_on=0.3,
+        min_duration_off=0.5,
+    )
+    sd = sherpa_onnx.OfflineSpeakerDiarization(config)
+    result = sd.process(signal.astype(np.float32))
+    raw = sorted((s.start, s.end, int(s.speaker)) for s in result.sort_by_start_time())
+    if not raw:
+        raise RuntimeError("sherpa-onnx で区間が得られませんでした")
+    # 隣接する同話者を結合し、ごく短い区間は前に吸収
+    merged = []
+    for a, b, lab in raw:
+        if merged and lab == merged[-1][2]:
+            merged[-1][1] = b
+        elif merged and (b - a) < 0.8:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b, lab])
+    return merged
+
+
+def diarize(video: Path, n_speakers=2, min_segment=1.5):
+    fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="diarize_")
+    os.close(fd)
+    tmp_wav = Path(tmp_name)
+    extract_wav(video, tmp_wav)
+    sr, data = wavfile.read(tmp_wav)
+    tmp_wav.unlink(missing_ok=True)
+    if data.dtype == np.int16:
+        signal = data.astype(np.float64) / 32768.0
+    else:
+        signal = data.astype(np.float64)
+
+    backend = "lite"
+    segments = None
+    if os.environ.get("DIARIZE_BACKEND", "").lower() != "lite":
+        try:
+            segments = _segments_sherpa(signal, n_speakers)
+            backend = "sherpa-onnx"
+        except Exception as e:
+            print(f"sherpa-onnx が使えないため簡易版にフォールバックします: {e}")
+    if segments is None:
+        segments = _segments_lite(signal, sr, n_speakers, min_segment)
+    result = _summarize(segments)
+    result["backend"] = backend
+    return result
 
 
 def export_samples(video: Path, result: dict, samples_dir: Path):
@@ -267,6 +343,7 @@ def main():
     if args.samples_dir:
         result["samples"] = export_samples(video, result, Path(args.samples_dir))
     Path(args.output).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"バックエンド: {result.get('backend')}")
     print(f"話者別 発話時間: {result['speakers']}")
     print(f"本編の話者(推定): 話者{result['main_speaker_guess']}")
     print(f"トリミング開始の提案: {result['suggested_trim_start']} 秒")

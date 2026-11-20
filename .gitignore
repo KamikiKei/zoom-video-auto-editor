@@ -11,3 +11,4 @@ test/samples/
 .DS_Store
 config.json
 .venv/
+models/

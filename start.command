@@ -30,9 +30,9 @@ else
   PY=python3
 fi
 
-if ! "$PY" -c "import numpy, scipy" 2>/dev/null; then
+if ! "$PY" -c "import numpy, scipy, sherpa_onnx" 2>/dev/null; then
   echo "必要な部品をインストールしています..."
-  "$PY" -m pip install numpy scipy || "$PY" -m pip install --user numpy scipy
+  "$PY" -m pip install numpy scipy sherpa-onnx || "$PY" -m pip install --user numpy scipy sherpa-onnx
 fi
 
 echo ""

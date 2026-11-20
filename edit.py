@@ -27,18 +27,44 @@ OP/EDの切り方:
 """
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 
 def probe(path: Path) -> dict:
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_streams", "-show_format",
-         "-of", "json", str(path)],
-        capture_output=True, text=True, check=True,
+    """ffprobe は使わず、ffmpeg -i の出力から必要な情報だけ取る。
+    (Windows の Smart App Control が、未使用の実行ファイル ffprobe を
+     ブロックして WinError 4551 になる問題の回避)"""
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", str(path)],
+        capture_output=True, text=True,
     )
-    return json.loads(out.stdout)
+    text = result.stderr or ""
+    m = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", text)
+    if not m:
+        raise RuntimeError(f"動画の長さを取得できませんでした: {path}")
+    duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    streams = []
+    for line in text.splitlines():
+        if "Stream" not in line:
+            continue
+        if "Video:" in line:
+            dm = re.search(r"(\d{2,5})x(\d{2,5})", line)
+            fm = re.search(r"([\d.]+)\s*fps", line)
+            fps = float(fm.group(1)) if fm else 30.0
+            streams.append({
+                "codec_type": "video",
+                "width": int(dm.group(1)) if dm else 1920,
+                "height": int(dm.group(2)) if dm else 1080,
+                "r_frame_rate": f"{fps}/1",
+            })
+        elif "Audio:" in line:
+            streams.append({"codec_type": "audio"})
+    if not any(s["codec_type"] == "video" for s in streams):
+        raise RuntimeError(f"映像ストリームが見つかりません: {path}")
+    return {"streams": streams, "format": {"duration": str(duration)}}
 
 
 def parse_time(v) -> float:

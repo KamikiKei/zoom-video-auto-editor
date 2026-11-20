@@ -53,10 +53,10 @@ if not exist .venv\Scripts\python.exe (
   exit /b 1
 )
 
-.venv\Scripts\python -c "import numpy, scipy" 2>nul
+.venv\Scripts\python -c "import numpy, scipy, sherpa_onnx" 2>nul
 if errorlevel 1 (
   echo 必要な部品をインストールしています...
-  .venv\Scripts\python -m pip install numpy scipy
+  .venv\Scripts\python -m pip install numpy scipy sherpa-onnx
 )
 
 echo.
