@@ -69,7 +69,11 @@ HTML = r"""<!DOCTYPE html>
   <div class="msg" id="videoName"></div>
   <video id="player" controls class="hidden"></video>
   <div style="height:10px"></div>
-  <div class="drop" id="thumbDrop">Canvaサムネ画像 (png/jpg) をドロップ / クリックで選択<input type="file" id="thumbFile" accept="image/*" class="hidden"></div>
+  <div class="drop" id="thumbDrop">OP/ED素材（画像 or 動画）をドロップ / クリックで選択<input type="file" id="thumbFile" accept="image/*,video/*" class="hidden"></div>
+  <div class="row">
+    <label><input type="radio" name="assetType" value="image" checked> 画像（表示秒数を決める）</label>
+    <label><input type="radio" name="assetType" value="video"> 動画（そのままつなぐ）</label>
+  </div>
   <img id="thumbPreview" class="thumb hidden">
 </div>
 
@@ -95,6 +99,11 @@ HTML = r"""<!DOCTYPE html>
     <label>頭サムネ <input type="number" id="introSec" value="3" step="0.5" min="0.5" style="width:70px"> 秒</label>
     <label>お尻サムネ <input type="number" id="outroSec" value="3" step="0.5" min="0.5" style="width:70px"> 秒</label>
     <label>ディゾルブ <input type="number" id="dissolve" value="0.8" step="0.1" min="0" style="width:70px"> 秒</label>
+    <span class="msg" id="assetNote"></span>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="silenceCut" checked> 無音をカットする</label>
+    <label><input type="number" id="silenceSec" value="3" step="0.5" min="1" style="width:60px"> 秒以上の無音を除去</label>
   </div>
 </div>
 
@@ -127,8 +136,20 @@ bindDrop('videoDrop','videoFile', f=>{
   p.onloadedmetadata=()=>{ videoDur=p.duration; $('endInput').value=fmt(videoDur); updateDur(); };
   $('analyzeBtn').disabled=false; $('runBtn').disabled = !thumbFile;
 });
+function syncAssetType(){
+  const t=document.querySelector('input[name=assetType]:checked').value;
+  const isVideo = t==='video';
+  $('introSec').disabled=isVideo; $('outroSec').disabled=isVideo;
+  $('assetNote').textContent = isVideo ? '動画素材はそのままの長さで頭とお尻につなぎます' : '';
+}
+document.querySelectorAll('input[name=assetType]').forEach(r=> r.onchange=syncAssetType);
 bindDrop('thumbDrop','thumbFile', f=>{
-  thumbFile=f; const im=$('thumbPreview'); im.src=URL.createObjectURL(f); im.classList.remove('hidden');
+  thumbFile=f;
+  const isVideo = (f.type||'').startsWith('video');
+  document.querySelector(`input[name=assetType][value="${isVideo?'video':'image'}"]`).checked=true;
+  syncAssetType();
+  const im=$('thumbPreview');
+  if(isVideo){ im.classList.add('hidden'); } else { im.src=URL.createObjectURL(f); im.classList.remove('hidden'); }
   $('runBtn').disabled = !videoFile;
 });
 bindDrop('transcriptDrop','transcriptFile', f=>{
@@ -235,7 +256,9 @@ $('runBtn').onclick=async()=>{
     const s=parseT($('startInput').value), e=parseT($('endInput').value);
     if(s==null||e==null||e<=s) throw new Error('開始・終了タイムを確認してください');
     await fetch(`/api/process/${jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-      trim_start:s, end:e, intro_sec:parseFloat($('introSec').value), outro_sec:parseFloat($('outroSec').value), dissolve:parseFloat($('dissolve').value)})});
+      trim_start:s, end:e, intro_sec:parseFloat($('introSec').value), outro_sec:parseFloat($('outroSec').value), dissolve:parseFloat($('dissolve').value),
+      asset_type:document.querySelector('input[name=assetType]:checked').value,
+      silence_cut:$('silenceCut').checked, silence_sec:parseFloat($('silenceSec').value)||3})});
     const bar=$('procProg'); bar.classList.remove('hidden'); bar.value=0;
     $('runMsg').textContent='編集中… 0%（この間、黒い画面は閉じないでください）';
     while(true){
@@ -327,7 +350,8 @@ class Handler(BaseHTTPRequestHandler):
         # /api/upload/<job_id>/<kind>
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "upload":
             job_id, kind = parts[2], parts[3]
-            dest_name = {"video": "input.mp4", "transcript": "transcript.vtt"}.get(kind, "thumb.png")
+            dest_name = {"video": "input.mp4", "transcript": "transcript.vtt",
+                         "thumb": "thumb_asset"}.get(kind, "thumb_asset")
             dest = job_dir(job_id) / dest_name
             n = int(self.headers.get("Content-Length") or 0)
             left = n
@@ -407,13 +431,16 @@ class Handler(BaseHTTPRequestHandler):
             "intro_sec": float(params.get("intro_sec", 3)),
             "outro_sec": float(params.get("outro_sec", 3)),
             "dissolve": float(params.get("dissolve", 0.8)),
+            "asset_type": params.get("asset_type", "image"),
+            "silence_cut": bool(params.get("silence_cut", False)),
+            "silence_sec": float(params.get("silence_sec", 3.0)),
         }
         def cb(pct):
             with LOCK:
                 JOBS[job_id]["progress"] = pct
         with LOCK:
             JOBS[job_id]["progress"] = 0
-        build_and_run(d / "input.mp4", d / "thumb.png", d / "output.mp4", cfg, progress_cb=cb)
+        build_and_run(d / "input.mp4", d / "thumb_asset", d / "output.mp4", cfg, progress_cb=cb)
         with LOCK:
             JOBS[job_id]["progress"] = 100
             JOBS[job_id]["stage"] = "done"
