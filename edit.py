@@ -150,16 +150,35 @@ def _keep_segments(silences, start, end, min_sec):
 
 
 def _build_main_cut(input_video, keeps, width, height, fps, out_path,
-                    crf, preset, progress_cb, main_dur):
-    """無音を除いた本編だけの中間ファイルを作る (つなぎ目はハードカット)"""
+                    crf, preset, progress_cb, main_dur, dissolve=0.0):
+    """無音を除いた本編だけの中間ファイルを作る。
+    つなぎ目にはディゾルブ (xfade/acrossfade) をかける。
+    短い区間ではディゾルブを自動で短くし、最低限の長さも確保する。"""
     scale = f"scale={width}:{height}:force_original_aspect_ratio=disable,setsar=1,fps={fps},format=yuv420p"
     filters = []
-    labels = []
     for i, (a, b) in enumerate(keeps):
         filters.append(f"[0:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{scale}[v{i}]")
         filters.append(f"[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a{i}]")
-        labels.append(f"[v{i}][a{i}]")
-    filters.append("".join(labels) + f"concat=n={len(keeps)}:v=1:a=1[v][a]")
+    if len(keeps) == 1 or dissolve <= 0:
+        labels = "".join(f"[v{i}][a{i}]" for i in range(len(keeps)))
+        filters.append(labels + f"concat=n={len(keeps)}:v=1:a=1[v][a]")
+    else:
+        # 区間をつないだ累積長を管理しながら xfade をチェーンする
+        cur_v, cur_a = "v0", "a0"
+        acc = keeps[0][1] - keeps[0][0]
+        for k in range(1, len(keeps)):
+            prev_len = keeps[k - 1][1] - keeps[k - 1][0]
+            seg_len = keeps[k][1] - keeps[k][0]
+            d = min(dissolve, 0.45 * prev_len, 0.45 * seg_len)
+            d = max(d, 1.0 / max(fps, 1))  # 最低1フレーム
+            d = min(d, seg_len * 0.9, acc * 0.9)
+            off = acc - d
+            filters.append(f"[{cur_v}][v{k}]xfade=transition=fade:duration={d:.3f}:offset={off:.3f}[vx{k}]")
+            filters.append(f"[{cur_a}][a{k}]acrossfade=d={d:.3f}[ax{k}]")
+            cur_v, cur_a = f"vx{k}", f"ax{k}"
+            acc = acc + seg_len - d
+        filters.append(f"[{cur_v}]null[v]")
+        filters.append(f"[{cur_a}]anull[a]")
     cmd = ["ffmpeg", "-y", "-i", str(input_video),
            "-filter_complex", ";".join(filters),
            "-map", "[v]", "-map", "[a]",
@@ -227,7 +246,8 @@ def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict, progr
         if cuts:
             tmp_cut = output.with_name(output.stem + "_maincut.mp4")
             _build_main_cut(input_video, keeps, width, height, fps, tmp_cut,
-                            max(10, crf - 3), preset, progress_cb, main_dur)
+                            max(10, crf - 3), preset, progress_cb, main_dur,
+                            dissolve=dissolve)
             main_input = tmp_cut
             main_start = 0.0
             main_end = float(probe(tmp_cut)["format"]["duration"])
