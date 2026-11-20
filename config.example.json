@@ -1,0 +1,12 @@
+{
+    "crf": 18,
+    "dissolve": 0.8,
+    "input_dir": "input",
+    "intro_sec": 3,
+    "output_dir": "output",
+    "outro_sec": 3,
+    "preset": "medium",
+    "thumb": "input/thumb.png",
+    "trim_start": 12,
+    "trim_tail": 8
+}

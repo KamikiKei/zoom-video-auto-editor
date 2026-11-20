@@ -1,0 +1,12 @@
+__pycache__/
+jobs/
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+*.mp4
+*.mp3
+*.wav
+test/samples/
+.DS_Store
+config.json
