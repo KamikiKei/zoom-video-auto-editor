@@ -1,18 +1,22 @@
 @echo off
-chcp 65001 >nul
 cd /d %~dp0
 echo ========================================
-echo  Zoomå‹•ç”» ã‹ã‚“ãŸã‚“ç·¨é›†ï¼ˆãƒ­ãƒ¼ã‚«ãƒ«ç‰ˆï¼‰
+echo  Zoom“®‰æ ‚©‚ñ‚½‚ñ•ÒWiƒ[ƒJƒ‹”Åj
 echo ========================================
 echo.
 
 where python >nul 2>nul
 if errorlevel 1 (
-  echo [ä¸è¶³] Python ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚
-  echo ä¸‹ã®ã‚³ãƒžãƒ³ãƒ‰ã‚’ã‚³ãƒžãƒ³ãƒ‰ãƒ—ãƒ­ãƒ³ãƒ—ãƒˆã§å®Ÿè¡Œã—ã¦å…¥ã‚Œã¦ã‹ã‚‰ã€
-  echo ã‚‚ã†ä¸€åº¦ã“ã®ãƒ•ã‚¡ã‚¤ãƒ«ã‚’ãƒ€ãƒ–ãƒ«ã‚¯ãƒªãƒƒã‚¯ã—ã¦ãã ã•ã„ã€‚
-  echo.
-  echo   winget install Python.Python.3.12
+  echo [•s‘«] Python ‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñB
+  set /p ANS="¡‚·‚®ƒCƒ“ƒXƒg[ƒ‹‚µ‚Ü‚·‚©H [Y/N]: "
+  if /i "%ANS%"=="Y" (
+    winget install Python.Python.3.12 --accept-package-agreements --accept-source-agreements
+    echo.
+    echo ƒCƒ“ƒXƒg[ƒ‹‚ªI‚í‚Á‚½‚çA‚à‚¤ˆê“x‚±‚Ìƒtƒ@ƒCƒ‹‚ðƒ_ƒuƒ‹ƒNƒŠƒbƒN‚µ‚Ä‚­‚¾‚³‚¢B
+  ) else (
+    echo ŽŸ‚ÌƒRƒ}ƒ“ƒh‚Å“ü‚ê‚Ä‚©‚çA‚à‚¤ˆê“x‚±‚Ìƒtƒ@ƒCƒ‹‚ðƒ_ƒuƒ‹ƒNƒŠƒbƒN‚µ‚Ä‚­‚¾‚³‚¢B
+    echo   winget install Python.Python.3.12
+  )
   echo.
   pause
   exit /b 1
@@ -20,30 +24,35 @@ if errorlevel 1 (
 
 where ffmpeg >nul 2>nul
 if errorlevel 1 (
-  echo [ä¸è¶³] ffmpeg ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚
-  echo ä¸‹ã®ã‚³ãƒžãƒ³ãƒ‰ã‚’ã‚³ãƒžãƒ³ãƒ‰ãƒ—ãƒ­ãƒ³ãƒ—ãƒˆã§å®Ÿè¡Œã—ã¦å…¥ã‚Œã¦ã‹ã‚‰ã€
-  echo ã‚‚ã†ä¸€åº¦ã“ã®ãƒ•ã‚¡ã‚¤ãƒ«ã‚’ãƒ€ãƒ–ãƒ«ã‚¯ãƒªãƒƒã‚¯ã—ã¦ãã ã•ã„ã€‚
-  echo.
-  echo   winget install Gyan.FFmpeg
+  echo [•s‘«] ffmpeg ‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñB
+  set /p ANS="¡‚·‚®ƒCƒ“ƒXƒg[ƒ‹‚µ‚Ü‚·‚©H [Y/N]: "
+  if /i "%ANS%"=="Y" (
+    winget install Gyan.FFmpeg --accept-package-agreements --accept-source-agreements
+    echo.
+    echo ƒCƒ“ƒXƒg[ƒ‹‚ªI‚í‚Á‚½‚çA‚à‚¤ˆê“x‚±‚Ìƒtƒ@ƒCƒ‹‚ðƒ_ƒuƒ‹ƒNƒŠƒbƒN‚µ‚Ä‚­‚¾‚³‚¢B
+  ) else (
+    echo ŽŸ‚ÌƒRƒ}ƒ“ƒh‚Å“ü‚ê‚Ä‚©‚çA‚à‚¤ˆê“x‚±‚Ìƒtƒ@ƒCƒ‹‚ðƒ_ƒuƒ‹ƒNƒŠƒbƒN‚µ‚Ä‚­‚¾‚³‚¢B
+    echo   winget install Gyan.FFmpeg
+  )
   echo.
   pause
   exit /b 1
 )
 
 if not exist .venv\Scripts\python.exe (
-  echo åˆå›žã‚»ãƒƒãƒˆã‚¢ãƒƒãƒ—ä¸­ã§ã™ã€‚å°‘ã—æ™‚é–“ãŒã‹ã‹ã‚Šã¾ã™...
+  echo ‰‰ñƒZƒbƒgƒAƒbƒv’†‚Å‚·B­‚µŽžŠÔ‚ª‚©‚©‚è‚Ü‚·...
   python -m venv .venv
 )
 
 .venv\Scripts\python -c "import numpy, scipy" 2>nul
 if errorlevel 1 (
-  echo å¿…è¦ãªéƒ¨å“ã‚’ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã—ã¦ã„ã¾ã™...
+  echo •K—v‚È•”•i‚ðƒCƒ“ƒXƒg[ƒ‹‚µ‚Ä‚¢‚Ü‚·...
   .venv\Scripts\python -m pip install numpy scipy
 )
 
 echo.
-echo èµ·å‹•ã—ã¾ã™ã€‚ãƒ–ãƒ©ã‚¦ã‚¶ãŒè‡ªå‹•ã§é–‹ãã¾ã™ã€‚
-echo çµ‚ã‚ã£ãŸã‚‰ã€ã“ã®é»’ã„ç”»é¢ã‚’é–‰ã˜ã¦ãã ã•ã„ã€‚
+echo ‹N“®‚µ‚Ü‚·Bƒuƒ‰ƒEƒU‚ªŽ©“®‚ÅŠJ‚«‚Ü‚·B
+echo I‚í‚Á‚½‚çA‚±‚Ì•‚¢‰æ–Ê‚ð•Â‚¶‚Ä‚­‚¾‚³‚¢B
 echo.
 timeout /t 2 /nobreak >nul
 start "" http://localhost:8765
