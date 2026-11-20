@@ -75,7 +75,7 @@ def parse_time(v) -> float:
     return sum(float(p) * 60 ** i for i, p in enumerate(reversed(parts)))
 
 
-def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict):
+def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict, progress_cb=None):
     info = probe(input_video)
     vstream = next(s for s in info["streams"] if s["codec_type"] == "video")
     has_audio = any(s["codec_type"] == "audio" for s in info["streams"])
@@ -101,7 +101,7 @@ def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict):
     outro = float(cfg.get("outro_sec", 3))
     dissolve = float(cfg.get("dissolve", 0.8))
     crf = int(cfg.get("crf", 18))
-    preset = cfg.get("preset", "medium")
+    preset = cfg.get("preset", "fast")
 
     if dissolve >= intro or dissolve >= outro or dissolve >= main_dur:
         raise ValueError("ディゾルブ秒数がクリップ長より長いです。dissolveを短くしてください")
@@ -154,10 +154,38 @@ def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict):
     print("実行:", " ".join(cmd[:6]), "...")
     print(f"  本編: {trim_start:.1f}s 〜 {end:.1f}s (残り {main_dur:.1f}s) / "
           f"intro {intro}s + outro {outro}s / dissolve {dissolve}s")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(result.stderr[-3000:], file=sys.stderr)
-        raise RuntimeError("ffmpeg が失敗しました")
+    expected = intro + main_dur + outro - 2 * dissolve
+    cmd = cmd[:-1] + ["-progress", "pipe:1", "-nostats", cmd[-1]]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, bufsize=1)
+    err_lines = []
+
+    def drain_err():
+        for ln in proc.stderr:
+            err_lines.append(ln)
+            if len(err_lines) > 80:
+                del err_lines[:40]
+
+    import threading
+    t = threading.Thread(target=drain_err, daemon=True)
+    t.start()
+    for ln in proc.stdout:
+        ln = ln.strip()
+        if ln.startswith(("out_time_us=", "out_time_ms=")):
+            try:
+                us = float(ln.split("=", 1)[1])
+            except ValueError:
+                continue
+            if progress_cb and expected > 0:
+                progress_cb(max(0, min(99, int(us / 1e6 / expected * 100))))
+        elif ln == "progress=end" and progress_cb:
+            progress_cb(100)
+    proc.wait()
+    t.join(timeout=2)
+    if proc.returncode != 0:
+        tail = "".join(err_lines)[-1500:]
+        print(tail, file=sys.stderr)
+        raise RuntimeError(f"ffmpeg が失敗しました: {tail.strip()[-300:]}")
     final = probe(output)
     print(f"  完了: {output} (長さ {float(final['format']['duration']):.1f}s, "
           f"想定 {intro + main_dur + outro - 2 * dissolve:.1f}s)")

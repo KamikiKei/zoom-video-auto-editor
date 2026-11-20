@@ -100,6 +100,7 @@ HTML = r"""<!DOCTYPE html>
 
 <div class="card"><h2><span class="step">4.</span> 編集してダウンロード</h2>
   <div class="row"><button id="runBtn" disabled>編集する</button><span class="msg" id="runMsg"></span></div>
+  <progress id="procProg" class="hidden" max="100" value="0"></progress>
   <video id="resultPlayer" controls class="hidden"></video>
   <div class="row"><a id="dlLink" class="hidden" download><button>完成mp4をダウンロード</button></a></div>
 </div>
@@ -150,6 +151,20 @@ function xhrUpload(url, file, progEl){
     x.send(file);
   });
 }
+async function pollStatus(){
+  // 一時的な接続失敗では落とさず、辛抱強く再試行する
+  let fails=0;
+  while(true){
+    try{
+      const st=await (await fetch(`/api/status/${jobId}`)).json();
+      return {st, fails};
+    }catch(e){
+      fails++;
+      if(fails>=40) throw new Error('サーバーに接続できません。黒い画面（サーバー）が閉じていないか確認してください');
+      await new Promise(r=>setTimeout(r,2000));
+    }
+  }
+}
 async function ensureJob(){
   if(jobId) return jobId;
   const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
@@ -168,7 +183,7 @@ $('analyzeBtn').onclick=async()=>{
     await fetch(`/api/diarize/${jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({speakers:2})});
     while(true){
       await new Promise(r=>setTimeout(r,2000));
-      const st=await (await fetch(`/api/status/${jobId}`)).json();
+      const {st}=await pollStatus();
       if(st.stage==='diarized'){ diar=st.diarization; break; }
       if(st.stage==='error'){ throw new Error(st.error||'解析に失敗'); }
     }
@@ -221,11 +236,13 @@ $('runBtn').onclick=async()=>{
     if(s==null||e==null||e<=s) throw new Error('開始・終了タイムを確認してください');
     await fetch(`/api/process/${jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
       trim_start:s, end:e, intro_sec:parseFloat($('introSec').value), outro_sec:parseFloat($('outroSec').value), dissolve:parseFloat($('dissolve').value)})});
-    $('runMsg').textContent='編集中… (動画の長さによります)';
+    const bar=$('procProg'); bar.classList.remove('hidden'); bar.value=0;
+    $('runMsg').textContent='編集中… 0%（この間、黒い画面は閉じないでください）';
     while(true){
-      await new Promise(r=>setTimeout(r,3000));
-      const st=await (await fetch(`/api/status/${jobId}`)).json();
-      if(st.stage==='done'){ break; }
+      await new Promise(r=>setTimeout(r,2000));
+      const {st}=await pollStatus();
+      if(typeof st.progress==='number'){ bar.value=st.progress; $('runMsg').textContent=`編集中… ${st.progress}%（この間、黒い画面は閉じないでください）`; }
+      if(st.stage==='done'){ bar.value=100; break; }
       if(st.stage==='error'){ throw new Error(st.error||'編集に失敗'); }
     }
     $('runMsg').innerHTML='<span class="ok">完成しました</span>';
@@ -278,7 +295,7 @@ class Handler(BaseHTTPRequestHandler):
                 job = JOBS.get(job_id)
             if not job:
                 return self._json({"error": "job not found"}, 404)
-            return self._json({k: job.get(k) for k in ("stage", "error", "diarization")})
+            return self._json({k: job.get(k) for k in ("stage", "error", "diarization", "progress")})
         if path.startswith("/api/sample/"):
             _, _, _, job_id, sp = path.split("/")
             f = job_dir(job_id) / "samples" / f"speaker{sp}.mp3"
@@ -391,8 +408,14 @@ class Handler(BaseHTTPRequestHandler):
             "outro_sec": float(params.get("outro_sec", 3)),
             "dissolve": float(params.get("dissolve", 0.8)),
         }
-        build_and_run(d / "input.mp4", d / "thumb.png", d / "output.mp4", cfg)
+        def cb(pct):
+            with LOCK:
+                JOBS[job_id]["progress"] = pct
         with LOCK:
+            JOBS[job_id]["progress"] = 0
+        build_and_run(d / "input.mp4", d / "thumb.png", d / "output.mp4", cfg, progress_cb=cb)
+        with LOCK:
+            JOBS[job_id]["progress"] = 100
             JOBS[job_id]["stage"] = "done"
 
 
