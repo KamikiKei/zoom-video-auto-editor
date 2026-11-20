@@ -75,6 +75,8 @@ HTML = r"""<!DOCTYPE html>
 
 <div class="card"><h2><span class="step">2.</span> 登壇者に代わる所を探す</h2>
   <div class="msg">まず動画をアップロードして話者を解析します。運営と登壇者を色で分けます。</div>
+  <div class="drop" id="transcriptDrop">Zoom文字起こし (.vtt) があればここにドロップ（話者名つきで正確に分けられます）<input type="file" id="transcriptFile" accept=".vtt,.txt" class="hidden"></div>
+  <div class="msg" id="transcriptName"></div>
   <div class="row"><button id="analyzeBtn" disabled>話者を解析する</button><span class="msg" id="analyzeMsg"></span></div>
   <progress id="upProg" class="hidden" max="100" value="0"></progress>
   <div class="timeline hidden" id="timeline"></div>
@@ -104,7 +106,7 @@ HTML = r"""<!DOCTYPE html>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let videoFile=null, thumbFile=null, jobId=null, uploaded=false, diar=null, videoDur=0;
+let videoFile=null, thumbFile=null, transcriptFile=null, jobId=null, uploaded=false, diar=null, videoDur=0;
 
 function fmt(s){ if(s==null||isNaN(s)) return ''; s=Math.max(0,Math.round(s)); const m=Math.floor(s/60), h=Math.floor(m/60); return h? `${h}:${String(m%60).padStart(2,'0')}:${String(s%60).padStart(2,'0')}` : `${m}:${String(s%60).padStart(2,'0')}`; }
 function parseT(v){ v=(v||'').trim(); if(!v) return null; if(/^\d+(\.\d+)?$/.test(v)) return parseFloat(v); const p=v.split(':').map(Number); if(p.some(isNaN)) return null; return p.reduce((a,b)=>a*60+b,0); }
@@ -127,6 +129,9 @@ bindDrop('videoDrop','videoFile', f=>{
 bindDrop('thumbDrop','thumbFile', f=>{
   thumbFile=f; const im=$('thumbPreview'); im.src=URL.createObjectURL(f); im.classList.remove('hidden');
   $('runBtn').disabled = !videoFile;
+});
+bindDrop('transcriptDrop','transcriptFile', f=>{
+  transcriptFile=f; $('transcriptName').textContent = '文字起こし: '+f.name+'（解析に使います）';
 });
 function updateDur(){
   const s=parseT($('startInput').value), e=parseT($('endInput').value);
@@ -158,7 +163,8 @@ $('analyzeBtn').onclick=async()=>{
   const btn=$('analyzeBtn'); btn.disabled=true; $('analyzeMsg').textContent='アップロード中…';
   try{
     await ensureUploaded();
-    $('analyzeMsg').textContent='解析中… (長い動画だと数分かかります)';
+    if(transcriptFile) await xhrUpload(`/api/upload/${jobId}/transcript`, transcriptFile, null);
+    $('analyzeMsg').textContent= transcriptFile ? '文字起こしを読み込み中…' : '解析中… (長い動画だと数分かかります)';
     await fetch(`/api/diarize/${jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({speakers:2})});
     while(true){
       await new Promise(r=>setTimeout(r,2000));
@@ -166,7 +172,9 @@ $('analyzeBtn').onclick=async()=>{
       if(st.stage==='diarized'){ diar=st.diarization; break; }
       if(st.stage==='error'){ throw new Error(st.error||'解析に失敗'); }
     }
-    $('analyzeMsg').innerHTML='<span class="ok">解析できました</span> 話者ごとの声を聞いて、登壇者を選んでください。';
+    $('analyzeMsg').innerHTML= diar.backend==='zoom-transcript'
+      ? '<span class="ok">解析できました</span> Zoom文字起こし（話者名つき）で分けました。登壇者を確認してください。'
+      : '<span class="ok">解析できました</span> 話者ごとの声を聞いて、登壇者を選んでください。';
     renderDiar();
   }catch(e){ $('analyzeMsg').innerHTML='<span class="err">'+e.message+'</span>'; }
   btn.disabled=false;
@@ -176,18 +184,21 @@ function renderDiar(){
   diar.segments.forEach(sg=>{
     const d=document.createElement('div'); d.className='seg sp'+sg.speaker;
     d.style.left=(sg.start/videoDur*100)+'%'; d.style.width=((sg.end-sg.start)/videoDur*100)+'%';
-    d.title=`話者${sg.speaker+1} ${fmt(sg.start)}〜${fmt(sg.end)}`;
+    d.title=`${(diar.names&&diar.names[sg.speaker])||('話者'+(sg.speaker+1))} ${fmt(sg.start)}〜${fmt(sg.end)}`;
     d.onclick=()=>{ $('player').currentTime=sg.start; $('player').play(); };
     tl.appendChild(d);
   });
   tl.onclick=e=>{ const r=tl.getBoundingClientRect(); $('player').currentTime=(e.clientX-r.left)/r.width*videoDur; };
   const wrap=$('speakerCards'); wrap.innerHTML='';
   Object.keys(diar.speakers).forEach(sp=>{
+    const nm=(diar.names&&diar.names[sp])||`話者${Number(sp)+1}`;
+    const isPresenter = diar.presenter_guess!=null && String(diar.presenter_guess)===String(sp);
+    const note = isPresenter ? ' <span class="msg">(紹介の直後なので登壇者っぽい)</span>'
+      : (String(diar.main_speaker_guess)===String(sp)?' <span class="msg">(いちばん長く話してるので登壇者っぽい)</span>':'');
     const card=document.createElement('div'); card.className='spcard';
-    card.innerHTML=`<span class="dot d${sp}"></span><b>話者${Number(sp)+1}</b> (発話 合計 ${fmt(diar.speakers[sp])}) `
+    card.innerHTML=`<span class="dot d${sp}"></span><b>${nm}</b> (発話 合計 ${fmt(diar.speakers[sp])}) `
       +`<audio controls src="/api/sample/${jobId}/${sp}" style="vertical-align:middle;height:32px"></audio> `
-      +`<label><input type="radio" name="mainsp" value="${sp}"> この人が登壇者</label>`
-      +(String(diar.main_speaker_guess)===String(sp)?' <span class="msg">(いちばん長く話してるので登壇者っぽい)</span>':'');
+      +`<label><input type="radio" name="mainsp" value="${sp}"> この人が登壇者</label>` + note;
     wrap.appendChild(card);
   });
   wrap.querySelectorAll('input[name=mainsp]').forEach(r=>{
@@ -197,7 +208,8 @@ function renderDiar(){
       if(seg){ $('startInput').value=fmt(seg.start); updateDur(); $('analyzeMsg').innerHTML=`<span class="ok">開始を ${fmt(seg.start)} にセットしました</span> (登壇者の最初の長い発言の頭)。プレビューで確認して、違うと思ったら手で直してください。`; }
     };
   });
-  const guess=wrap.querySelector(`input[name=mainsp][value="${diar.main_speaker_guess}"]`);
+  const target = diar.presenter_guess!=null ? diar.presenter_guess : diar.main_speaker_guess;
+  const guess=wrap.querySelector(`input[name=mainsp][value="${target}"]`);
   if(guess){ guess.checked=true; guess.dispatchEvent(new Event('change')); }
 }
 $('runBtn').onclick=async()=>{
@@ -298,8 +310,8 @@ class Handler(BaseHTTPRequestHandler):
         # /api/upload/<job_id>/<kind>
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "upload":
             job_id, kind = parts[2], parts[3]
-            ext = "mp4" if kind == "video" else "png"
-            dest = job_dir(job_id) / (f"input.{ext}" if kind == "video" else "thumb.png")
+            dest_name = {"video": "input.mp4", "transcript": "transcript.vtt"}.get(kind, "thumb.png")
+            dest = job_dir(job_id) / dest_name
             n = int(self.headers.get("Content-Length") or 0)
             left = n
             with dest.open("wb") as fh:
@@ -352,7 +364,16 @@ class Handler(BaseHTTPRequestHandler):
         sys.path.insert(0, str(BASE))
         from diarize import diarize, export_samples
         d = job_dir(job_id)
-        result = diarize(d / "input.mp4", n_speakers=int(params.get("speakers", 2)))
+        result = None
+        tpath = d / "transcript.vtt"
+        if tpath.exists() and tpath.stat().st_size > 0:
+            try:
+                from transcript import result_from_transcript
+                result = result_from_transcript(tpath)
+            except Exception:  # noqa: BLE001
+                result = None  # 文字起こしが使えなければ音声解析にフォールバック
+        if result is None:
+            result = diarize(d / "input.mp4", n_speakers=int(params.get("speakers", 2)))
         result["samples"] = export_samples(d / "input.mp4", result, d / "samples")
         with LOCK:
             JOBS[job_id]["diarization"] = result
