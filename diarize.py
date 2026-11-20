@@ -21,8 +21,10 @@
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -134,9 +136,12 @@ def smooth(labels, size=3):
 
 
 def diarize(video: Path, n_speakers=2, min_segment=1.5):
-    tmp_wav = Path("/tmp/_diarize.wav")
+    fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="diarize_")
+    os.close(fd)
+    tmp_wav = Path(tmp_name)
     extract_wav(video, tmp_wav)
     sr, data = wavfile.read(tmp_wav)
+    tmp_wav.unlink(missing_ok=True)
     if data.dtype == np.int16:
         signal = data.astype(np.float64) / 32768.0
     else:
