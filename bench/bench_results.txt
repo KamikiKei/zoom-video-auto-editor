@@ -1,0 +1,31 @@
+=== benchmark run v2 2026-11-20 20:55:39 UTC ===
+CPU:  AMD EPYC 9D64 88-Core Processor / nproc=4 / shared CPU quota 1.5
+source: src_1080p_180s.mp4 (180s, 1920x1080, 30fps, h264 crf23, testsrc2)
+--- raw fast threads=1 : wall 322s / frame=5400 fps=17 speed=0.559x (v1 run 2026-11-20 measured)
+--- raw fast threads=2 : wall 336s / frame= 5400 fps= 16 q=-1.0 Lsize=N/A time=00:02:59.93 bitrate=N/A speed=0.538x elapsed=0:05:34.56 
+--- raw fast threads=default : wall 337s / frame= 5400 fps= 16 q=-1.0 Lsize=N/A time=00:02:59.93 bitrate=N/A speed=0.534x elapsed=0:05:36.72 
+--- raw medium threads=default : wall 360s / frame= 5400 fps= 15 q=-1.0 Lsize=N/A time=00:02:59.93 bitrate=N/A speed= 0.5x elapsed=0:06:00.07 
+--- raw veryfast threads=default : wall 136s / frame= 5400 fps= 40 q=-1.0 Lsize=N/A time=00:02:59.93 bitrate=N/A speed=1.33x elapsed=0:02:15.74 
+--- silencedetect only : wall 1s / size=N/A time=00:03:00.01 bitrate=N/A speed= 751x elapsed=0:00:00.23 
+Traceback (most recent call last):
+  File "/home/hatch/workspace/video-auto-editor/bench/../edit.py", line 389, in <module>
+    main()
+  File "/home/hatch/workspace/video-auto-editor/bench/../edit.py", line 352, in main
+    cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 1029, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 1015, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'cfg_fast.json'
+--- edit.py full pipeline preset=fast : wall 0s
+duration=180.566667
+size=8477353
+  無音カット: 5箇所 / 合計 50.0秒を除去
+実行: ffmpeg -y -loop 1 -framerate 30.0 ...
+  本編: 0.0s 〜 106.0s (残り 106.0s) / intro 3.0s + outro 3.0s / dissolve 0.8s / 素材=image
+  完了: out_fast.mp4 (長さ 110.4s, 想定 110.4s)
+--- edit.py full pipeline preset=fast (testsrc2) : wall 403s
+EDITPY_DONE

@@ -1,0 +1,32 @@
+=== zoomlike benchmark run 2026-11-20 21:22:27 UTC ===
+source: zoomlike_1080p_180s.mp4 (180s, 1920x1080, 30fps, static slide + PiP speaker)
+--- raw fast threads=default : wall 113s / frame= 5417 fps= 48 q=-1.0 Lsize=N/A time=00:03:00.01 bitrate=N/A speed= 1.6x elapsed=0:01:52.61 
+--- raw veryfast threads=default : wall 66s / frame= 5417 fps= 82 q=-1.0 Lsize=N/A time=00:03:00.01 bitrate=N/A speed=2.74x elapsed=0:01:05.79 
+Traceback (most recent call last):
+  File "/home/hatch/workspace/video-auto-editor/bench/../edit.py", line 389, in <module>
+    main()
+  File "/home/hatch/workspace/video-auto-editor/bench/../edit.py", line 352, in main
+    cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 1029, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 1015, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'cfg_fast.json'
+--- edit.py full pipeline preset=fast : wall 0s
+  無音カット: 5箇所 / 合計 50.0秒を除去
+実行: ffmpeg -y -loop 1 -framerate 30.0 ...
+  本編: 0.0s 〜 106.6s (残り 106.6s) / intro 3.0s + outro 3.0s / dissolve 0.8s / 素材=image
+  完了: out_zoomlike_fast.mp4 (長さ 111.0s, 想定 111.0s)
+--- edit.py full pipeline preset=fast (zoomlike) : wall 201s
+  無音カット: 5箇所 / 合計 50.0秒を除去
+実行: ffmpeg -y -loop 1 -framerate 30.0 ...
+  本編: 0.0s 〜 106.6s (残り 106.6s) / intro 3.0s + outro 3.0s / dissolve 0.8s / 素材=image
+  完了: out_zoomlike_veryfast.mp4 (長さ 111.0s, 想定 111.0s)
+--- edit.py full pipeline preset=veryfast (zoomlike) : wall 147s
+-rw-rw---- 1 root nogroup 97085899 Nov 20 21:36 out_fast.mp4
+-rw-rw---- 1 root nogroup  8016755 Nov 20 21:39 out_zoomlike_fast.mp4
+-rw-rw---- 1 root nogroup  7321374 Nov 20 21:41 out_zoomlike_veryfast.mp4
+EDITPY_DONE

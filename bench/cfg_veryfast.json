@@ -1,0 +1,2 @@
+{"crf": 18, "dissolve": 0.8, "intro_sec": 3, "outro_sec": 3, "preset": "veryfast",
+ "trim_start": 12, "trim_tail": 8, "silence_cut": true, "silence_sec": 3.0, "silence_db": -38}
