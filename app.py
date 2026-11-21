@@ -63,6 +63,13 @@ HTML = r"""<!DOCTYPE html>
   .tl-seg.is-cand{box-shadow:inset 0 0 0 2px #e6a817}
   .tl-seg.is-user{box-shadow:inset 0 -3px 0 rgba(20,40,80,.55)}
   .tl-seg.is-cand.is-user{box-shadow:inset 0 0 0 2px #e6a817,inset 0 -3px 0 rgba(20,40,80,.55)}
+  /* 候補の出所は上端の帯で区別する (title属性に理由も出る) */
+  .tl-seg.is-llm{box-shadow:inset 0 3px 0 #8e44ad}
+  .tl-seg.is-ops{box-shadow:inset 0 3px 0 #14406e}
+  .tl-seg.is-other{box-shadow:inset 0 3px 0 #5a5a5a}
+  .tl-seg.is-cand.is-llm{box-shadow:inset 0 0 0 2px #e6a817,inset 0 3px 0 #8e44ad}
+  .tl-seg.is-cand.is-ops{box-shadow:inset 0 0 0 2px #e6a817,inset 0 3px 0 #14406e}
+  .tl-seg.is-cand.is-other{box-shadow:inset 0 0 0 2px #e6a817,inset 0 3px 0 #5a5a5a}
   .tl-seg{cursor:pointer}
   .tl-out{background:rgba(0,0,0,.28)}
   #tlPlayhead{position:absolute;top:0;bottom:0;width:2px;background:#e02424;z-index:5;pointer-events:none}
@@ -100,7 +107,7 @@ HTML = r"""<!DOCTYPE html>
       <div id="tlPlayhead"></div>
       <div id="tlStartMarker"></div>
     </div></div>
-    <div class="msg" style="margin-top:6px">タイムライン（1本）：色＝話者（灰色＝話者なし）、斜線＋暗い区間＝カット、黄色枠＝カット候補だけど残す。区間をタップ（クリック）すると 消す⇔残す が切り替わり、その位置を再生します。残す区間もタップでカットにできます（もう一度タップで戻ります）。緑＝開始点（ドラッグで移動）。ボタン／スライダー／Ctrl+ホイールで拡大縮小。</div>
+    <div class="msg" style="margin-top:6px">タイムライン（1本）：色＝話者（灰色＝話者なし）、斜線＋暗い区間＝カット、黄色枠＝カット候補だけど残す。候補の出所は上端の帯の色で区別します（紫＝AI検出、濃青＝運営の発話、灰＝登壇者以外の発話）。区間にマウスを乗せると候補の理由が表示されます。区間をタップ（クリック）すると 消す⇔残す が切り替わり、その位置を再生します。残す区間もタップでカットにできます（もう一度タップで戻ります）。緑＝開始点（ドラッグで移動）。ボタン／スライダー／Ctrl+ホイールで拡大縮小。</div>
   </div>
   <div style="height:10px"></div>
   <div class="drop" id="thumbDrop">OP/ED素材（画像 or 動画）をドロップ / クリックで選択<input type="file" id="thumbFile" accept="image/*,video/*" class="hidden"></div>
@@ -140,7 +147,7 @@ HTML = r"""<!DOCTYPE html>
     <label><input type="number" id="silenceSec" value="3" step="0.5" min="1" style="width:60px"> 秒以上の無音を除去</label>
   </div>
   <div id="cutWrap" class="hidden">
-    <div class="msg">カット候補（無音区間）は上のタイムラインに表示されます。斜線の区間が「切る」、黄色枠は「候補だけど残す」。区間をタップ（クリック）すると 消す⇔残す が切り替わり、その位置を再生して確認できます（画面共有中の音声など、消したくない区間はタップして残してください）。残す区間もタップすればカットにできます。</div>
+    <div class="msg">カット候補は上のタイムラインに表示されます。斜線の区間が「切る」、黄色枠は「候補だけど残す」。候補には無音のほか、文字起こしがある場合は「運営など登壇者以外の発話」と「AI検出（もたつき・トラブル）」も最初から入ります（デフォルトで残すのは登壇者の発話のみ）。区間をタップ（クリック）すると 消す⇔残す が切り替わり、その位置を再生して確認できます（画面共有中の音声など、消したくない区間はタップして残してください）。残す区間もタップすればカットにできます。</div>
     <div class="row"><button class="sub" id="refetchCutsBtn">カット候補を再検出</button><span class="msg" id="cutMsg"></span></div>
   </div>
 </div>
@@ -289,18 +296,25 @@ function renderDiar(presenters){
       +`<label><input type="checkbox" name="presenters" value="${sp}"${defaults.includes(Number(sp))?' checked':''}> 登壇者として扱う（複数可）</label>` + note;
     wrap.appendChild(card);
   });
-  wrap.querySelectorAll('input[name=presenters]').forEach(cb=>{ cb.onchange=updateStartFromPresenters; });
+  wrap.querySelectorAll('input[name=presenters]').forEach(cb=>{ cb.onchange=()=>{
+    updateStartFromPresenters();
+    // 登壇者を変えたら、保持ポリシーの候補 (登壇者以外の発話) も作り直す
+    if(diar&&diar.backend==='zoom-transcript') loadSilences();
+  }; });
   updateStartFromPresenters();
   renderTimeline();
 }
 let cutCandidates=[];
+const SRC_LABEL={silence:'無音', ops:'運営の発話', other:'登壇者以外の発話', llm:'AI検出', user:'手動カット'};
 function renderCuts(){
   $('cutWrap').classList.remove('hidden');
   if(!cutCandidates.length){ $('cutMsg').textContent='カット候補はありません（タイムラインの区間をタップするとカットにできます）'; }
   else{
     const on=cutCandidates.filter(c=>c.enabled).length;
-    const usr=cutCandidates.filter(c=>c.source==='user').length;
-    $('cutMsg').textContent=`カット区間 ${cutCandidates.length}件（うち ${on}件を切る / タップで付けたカット ${usr}件）— タイムラインの区間タップで切り替えてください`;
+    const parts=Object.keys(SRC_LABEL)
+      .map(s=>[SRC_LABEL[s], cutCandidates.filter(c=>c.source===s).length])
+      .filter(([,n])=>n>0).map(([l,n])=>`${l} ${n}件`).join(' / ');
+    $('cutMsg').textContent=`カット候補 ${cutCandidates.length}件（うち ${on}件を切る）内訳: ${parts} — タイムラインの区間タップで切り替えてください`;
   }
   renderTimeline();
 }
@@ -309,14 +323,21 @@ async function loadSilences(){
   $('cutWrap').classList.remove('hidden');
   $('cutMsg').textContent='カット候補を検出中…';
   try{
-    await fetch(`/api/silences/${jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({silence_sec:parseFloat($('silenceSec').value)||3})});
+    await fetch(`/api/silences/${jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({silence_sec:parseFloat($('silenceSec').value)||3, presenters:selectedPresenters()})});
     while(true){
       await new Promise(r=>setTimeout(r,1500));
       const {st}=await pollStatus();
       if(st.silence_stage==='done'){
-        // 再検出しても手動カットは消さない
-        const users=cutCandidates.filter(c=>c.source==='user');
-        cutCandidates=(st.silences||[]).map(c=>({...c, source:c.source||'silence'})).concat(users);
+        // 再検出しても手動カットとAI検出候補は消さない。
+        // 「残す」にした候補の無効化状態も、範囲が一致すれば引き継ぐ
+        const keep=cutCandidates.filter(c=>c.source==='user'||c.source==='llm');
+        const prevOff=cutCandidates.filter(c=>!c.enabled&&c.source!=='user'&&c.source!=='llm');
+        const fetched=(st.silences||[]).map(c=>{
+          const n={...c, source:c.source||'silence'};
+          if(prevOff.some(p=>Math.abs(p.start-n.start)<0.6&&Math.abs(p.end-n.end)<0.6)) n.enabled=false;
+          return n;
+        });
+        cutCandidates=fetched.concat(keep);
         break;
       }
       if(st.silence_stage==='error'){ throw new Error(st.error||'検出に失敗'); }
@@ -391,13 +412,21 @@ function renderLane(){
     if(cand&&cand.enabled) cls+=' is-cut';
     if(cand&&!cand.enabled) cls+=' is-cand';
     if(cand&&cand.source==='user') cls+=' is-user';
+    if(cand&&cand.source==='llm') cls+=' is-llm';
+    if(cand&&cand.source==='ops') cls+=' is-ops';
+    if(cand&&cand.source==='other') cls+=' is-other';
     if(cand) cls+=' tl-candblk';
     const d=tlAddBlock(lane,a,b,cls);
     if(!d) continue;
     const nm=sp==null?'話者なし':((diar.names&&diar.names[sp])||('話者'+(Number(sp)+1)));
     const state=!cand?'残す':(cand.enabled?'カット':'候補だけど残す');
-    const kindTxt=cand?(cand.source==='user'?'タップで追加したカット':'無音候補'):'';
-    d.title=`${nm} ${fmt(a)}〜${fmt(b)}（${state}${kindTxt?' / '+kindTxt:''}） タップで切替`;
+    const kindTxt=cand?(cand.source==='user'?'タップで追加したカット'
+      : cand.source==='llm'?('AI検出候補'+(cand.kind?': '+({trouble:'トラブル対応',fumbling:'もたつき',offtopic:'本題外'})[cand.kind]||cand.kind:''))
+      : cand.source==='ops'?'運営の発話（デフォルトでカット候補）'
+      : cand.source==='other'?'登壇者以外の発話（デフォルトでカット候補）'
+      : '無音候補'):'';
+    const reasonTxt=cand&&cand.reason?(' / 理由: '+cand.reason):'';
+    d.title=`${nm} ${fmt(a)}〜${fmt(b)}（${state}${kindTxt?' / '+kindTxt:''}${reasonTxt}） タップで切替`;
     if((b-a)*tlPxPerSec()>52) d.textContent=nm;
     d.onclick=ev2=>{
       ev2.stopPropagation();
@@ -494,7 +523,8 @@ $('runBtn').onclick=async()=>{
       silence_cut:$('silenceCut').checked, silence_sec:parseFloat($('silenceSec').value)||3,
       presenters:selectedPresenters(),
       disabled_cuts:cutCandidates.filter(c=>!c.enabled&&c.source!=='user').map(c=>[c.start,c.end]),
-      user_cuts:cutCandidates.filter(c=>c.enabled&&c.source==='user').map(c=>[c.start,c.end])})});
+      user_cuts:cutCandidates.filter(c=>c.enabled&&c.source==='user').map(c=>[c.start,c.end]),
+      llm_cuts:cutCandidates.filter(c=>c.enabled&&c.source==='llm').map(c=>[c.start,c.end])})});
     const bar=$('procProg'); bar.classList.remove('hidden'); bar.value=0;
     $('runMsg').textContent='編集中… 0%（この間、黒い画面は閉じないでください）';
     while(true){
@@ -785,14 +815,19 @@ class Handler(BaseHTTPRequestHandler):
         threading.Thread(target=wrap, daemon=True).start()
 
     def _run_silences(self, job_id, params):
-        """無音カット候補の検出を非同期で走らせる (stage は触らない)。"""
+        """カット候補の検出を非同期で走らせる (stage は触らない)。
+
+        無音候補に加え、文字起こしがあればデフォルト保持ポリシーの候補
+        (登壇者以外の発話: source=ops/other) も返す。生成規則は
+        edit.compute_plan と同じ (edit._policy_candidates)。
+        """
         def wrap():
             with LOCK:
                 JOBS.setdefault(job_id, {})["silence_stage"] = "running"
             try:
                 import sys
                 sys.path.insert(0, str(BASE))
-                from edit import detect_silences
+                from edit import detect_silences, probe
                 d = job_dir(job_id)
                 min_sec = float(params.get("silence_sec", 3.0))
                 db = int(params.get("silence_db", -38))
@@ -800,6 +835,27 @@ class Handler(BaseHTTPRequestHandler):
                 cands = [{"start": round(s, 3), "end": round(e, 3),
                           "kind": "silence", "source": "silence", "enabled": True}
                          for s, e in found if e - s >= min_sec - 0.05]
+                tpath = d / "transcript.vtt"
+                if tpath.exists() and tpath.stat().st_size > 0:
+                    try:
+                        from transcript import build_result, parse_transcript
+                        from edit import _policy_candidates
+                        cues = parse_transcript(tpath)
+                        result = build_result(cues)
+                        if params.get("presenters") is not None:
+                            presenters = [int(p) for p in params["presenters"]]
+                        else:
+                            guess = result.get(
+                                "presenter_guess",
+                                result.get("main_speaker_guess"))
+                            presenters = [int(guess)] if guess is not None else []
+                        dur = float(probe(d / "input.mp4")["format"]["duration"])
+                        for cand in _policy_candidates(
+                                result, cues, presenters, 0.0, dur):
+                            cands.append({**cand, "enabled": True})
+                        cands.sort(key=lambda c: c["start"])
+                    except Exception:  # noqa: BLE001
+                        pass  # ポリシー候補が作れなくても無音候補は返す
                 with LOCK:
                     JOBS[job_id]["silences"] = cands
                     JOBS[job_id]["silence_stage"] = "done"
@@ -852,6 +908,20 @@ class Handler(BaseHTTPRequestHandler):
         if params.get("user_cuts") is not None:
             cfg["user_cuts"] = [[float(a), float(b)]
                                 for a, b in params["user_cuts"]]
+        if params.get("llm_cuts") is not None:
+            cfg["llm_cuts"] = [[float(a), float(b)]
+                               for a, b in params["llm_cuts"]]
+        # 文字起こしが使えるジョブでは、書き出し時にも保持ポリシー
+        # (登壇者以外の発話カット) が効くよう transcript を渡す。
+        # パースできない文字起こしは渡さない (従来動作にフォールバック)。
+        tpath = d / "transcript.vtt"
+        if tpath.exists() and tpath.stat().st_size > 0:
+            try:
+                from transcript import result_from_transcript
+                result_from_transcript(tpath)
+                cfg["transcript"] = str(tpath)
+            except Exception:  # noqa: BLE001
+                pass
         def cb(pct):
             with LOCK:
                 JOBS[job_id]["progress"] = pct

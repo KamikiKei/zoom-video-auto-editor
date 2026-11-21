@@ -87,6 +87,11 @@ python3 -m pipeline.daemon --poll --interval 300
 | `SLACK_WEBHOOK_URL` | あれば Webhook 通知、無ければコンソール | - |
 | `ZOOM_ACCOUNT_ID` / `ZOOM_CLIENT_ID` / `ZOOM_CLIENT_SECRET` | Zoom S2S 認証情報 (実接続用) | - |
 | `YOUTUBE_CLIENT_SECRETS` / `YOUTUBE_TOKEN_FILE` | YouTube OAuth 用 (実接続用) | - |
+| `GEMINI_API_KEY`（または `GOOGLE_API_KEY`） | AI検出 (候補提案) 用。無ければ検出はスキップ | - |
+| `GEMINI_MODEL` / `LLM_DETECT` | AI検出のモデル / `mock`・`off` の切替 | `gemini-2.5-flash` / - |
+
+AI検出とデフォルト保持ポリシー（登壇者以外の発話を最初からカット候補にする）
+の設計・コスト・失敗時の挙動は **docs/AI検出.md** を参照。
 
 ## 実サービスへの差し替え手順
 

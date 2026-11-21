@@ -98,12 +98,16 @@ grep -q "エンコーダ:" enc.log
 check "$(dur outF.mp4)" 11.0 "F encoder auto"
 
 echo "== Case G: 複数登壇者 (presenters で開始点が変わる) =="
+# 注: Case G は「開始点の提案ロジック」単体の検証。デフォルト保持ポリシー
+# (登壇者以外をカット候補にする) が入ると presenters=[0] のときに登壇者の
+# 区間まで候補になり期待値が変わるため、ここではポリシーを無効化する。
+# ポリシー自体の検証は Case K と test/test_ai_detect.py で行う。
 $E plan --video sil.mp4 --transcript sample.vtt --thumb "$OLDPWD/$THUMB" \
   --silence-cut --silence-sec 3 --intro-sec 2 --outro-sec 2 --dissolve 0.5 \
-  --presenters 0 --out planG0.json > /dev/null
+  --presenters 0 --no-keep-presenters-only --out planG0.json > /dev/null
 $E plan --video sil.mp4 --transcript sample.vtt --thumb "$OLDPWD/$THUMB" \
   --silence-cut --silence-sec 3 --intro-sec 2 --outro-sec 2 --dissolve 0.5 \
-  --presenters 0,1 --out planG01.json > /dev/null
+  --presenters 0,1 --no-keep-presenters-only --out planG01.json > /dev/null
 python3 - <<'PY'
 import json
 p0 = json.load(open("planG0.json"))
@@ -179,5 +183,70 @@ PY
 $E render --plan planJ.json -o outJ.mp4 > /dev/null 2>&1
 # 保持13s - つなぎ0.5*2 + 2 + 2 - 0.5*2 = 15.0
 check "$(dur outJ.mp4)" 15.0 "J render (silence + user)"
+
+echo "== Case K: デフォルト保持ポリシー (登壇者以外は最初からカット候補) =="
+# rich.vtt: 運営の紹介 (0-3) -> 登壇者 (3-10) -> 運営の連絡 (10-13)
+#           -> 参加者の質問 (13-16) -> 登壇者 (16-20)
+cat > rich.vtt <<'VTT'
+WEBVTT
+
+1
+00:00:00.000 --> 00:00:03.000
+運営: それでは本日の登壇者をご紹介します。
+
+2
+00:00:03.000 --> 00:00:10.000
+登壇者: はい、よろしくお願いします。本日はRAGの評価について話します。
+
+3
+00:00:10.000 --> 00:00:13.000
+運営: ここで次回日程の連絡です。
+
+4
+00:00:13.000 --> 00:00:16.000
+参加者A: すみません、質問があります。
+
+5
+00:00:16.000 --> 00:00:20.000
+登壇者: では最後にまとめます。
+VTT
+$E plan --video plain.mp4 --transcript rich.vtt --thumb "$OLDPWD/$THUMB" \
+  --intro-sec 2 --outro-sec 2 --dissolve 0.5 --out planK.json > /dev/null
+python3 - <<'PY'
+import json
+p = json.load(open("planK.json"))
+cands = p["silence"]["candidates"]
+by_src = {c["source"]: c for c in cands}
+assert by_src["ops"]["start"] == 10.0 and by_src["ops"]["end"] == 13.0, cands
+assert by_src["other"]["start"] == 13.0 and by_src["other"]["end"] == 16.0, cands
+assert all(c["enabled"] for c in cands), cands
+assert all(c["reason"] for c in cands), cands
+# 登壇者の発表区間 [3,10] だけが残る (開始点も登壇者の頭 3.0)
+assert p["trim_start"] == 3.0, p
+assert p["silence"]["keeps"] == [[3.0, 10.0], [16.0, 20.0]], p["silence"]
+assert p["keep_policy"] == {"keep_presenters_only": True, "applied": True}, p
+assert p["llm_detection"]["status"] == "skipped", p["llm_detection"]
+# 保持11s - つなぎ0.5 + 2 + 2 - 0.5*2 = 13.5
+assert p["expected_duration"] == 13.5, p
+print("OK   K plan JSON (policy candidates ops/other)")
+PY
+$E render --plan planK.json -o outK.mp4 > /dev/null 2>&1
+check "$(dur outK.mp4)" 13.5 "K render (policy)"
+
+echo "== Case L: 強制レガシー (2パス) でも無音以外のカットが効く =="
+# 回帰防止: 以前は _render_legacy が無音カット有効時のみ保持区間を適用して
+# いたため、ユーザー/ポリシー/LLM カットだけの plan を 2パスで描くと
+# カットが全部落ちていた。one_pass=False で同じことを確認する。
+cat > cfgL.json <<'JSON'
+{"trim_start": 3, "end": 20, "intro_sec": 2, "outro_sec": 2, "dissolve": 0.5,
+ "silence_cut": false, "user_cuts": [[13, 20]], "one_pass": false}
+JSON
+$E plain.mp4 "$OLDPWD/$THUMB" -o outL.mp4 --config cfgL.json > /dev/null 2>&1
+# 保持 [3,13] の10s + 2 + 2 - 0.5*2 = 13.0
+check "$(dur outL.mp4)" 13.0 "L legacy fallback (user cut, silence off)"
+
+echo "== AI検出・ポリシーの単体テスト (モック/フェイクHTTP) =="
+python3 "$OLDPWD/test/test_ai_detect.py" > ai_detect.log 2>&1 \
+  && echo "OK   test_ai_detect.py" || { cat ai_detect.log; exit 1; }
 
 echo "REGRESSION OK"

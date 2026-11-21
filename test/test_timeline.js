@@ -74,18 +74,28 @@ const tests = `
   cutCandidates = [
     { start:20, end:30, kind:'silence', source:'silence', enabled:true },
     { start:50, end:55, kind:'silence', source:'silence', enabled:false },
+    { start:60, end:65, kind:'trouble', source:'llm', reason:'「聞こえますか」を含むトラブル対応の発話', enabled:true },
+    { start:80, end:85, kind:'speaker', source:'ops', reason:'運営の発話 — デフォルトでは登壇者のみ残す', enabled:true },
   ];
   renderTimeline();
 
-  // --- 統合レーンの分割: [10,90] が境界で欠けなく6区間に分かれる ---
-  assert.strictEqual(segs().length, 6, 'segment blocks = 6, got ' + segs().length);
-  assert.strictEqual(lane().children.length, 8, 'blocks incl. out-range = 8, got ' + lane().children.length);
-  const b2030 = byRange(20, 30), b4045 = byRange(40, 50), b5055 = byRange(50, 55), b5560 = byRange(55, 90);
+  // --- 統合レーンの分割: [10,90] が境界で欠けなく10区間に分かれる ---
+  assert.strictEqual(segs().length, 10, 'segment blocks = 10, got ' + segs().length);
+  assert.strictEqual(lane().children.length, 12, 'blocks incl. out-range = 12, got ' + lane().children.length);
+  const b2030 = byRange(20, 30), b4045 = byRange(40, 50), b5055 = byRange(50, 55), b5560 = byRange(55, 60);
   assert(b2030 && b2030._cls.has('sp0') && b2030._cls.has('is-cut'), '[20,30] speaker0 + cut');
   assert(b4045 && b4045._cls.has('sp1') && !b4045._cls.has('is-cut'), '[40,50] speaker1 + keep');
   assert(b5055 && b5055._cls.has('sp1') && b5055._cls.has('is-cand') && !b5055._cls.has('is-cut'), '[50,55] kept candidate');
-  assert(b5560 && !b5560._cls.has('is-cand'), '[55,90] plain keep');
+  assert(b5560 && !b5560._cls.has('is-cand'), '[55,60] plain keep');
   console.log('OK   lane partition (speaker x cut state in one lane)');
+
+  // --- AI検出・運営候補は帯クラスと title (理由) で区別できる ---
+  const b6065 = byRange(60, 65), b8085 = byRange(80, 85);
+  assert(b6065 && b6065._cls.has('is-llm') && b6065._cls.has('is-cut'), '[60,65] llm candidate + cut');
+  assert(b6065.title.includes('AI検出') && b6065.title.includes('聞こえますか'), 'llm title shows kind + reason: ' + b6065.title);
+  assert(b8085 && b8085._cls.has('is-ops') && b8085._cls.has('is-cut'), '[80,85] ops candidate + cut');
+  assert(b8085.title.includes('運営の発話'), 'ops title shows reason: ' + b8085.title);
+  console.log('OK   candidate sources distinguished (llm / ops, reason in title)');
 
   // --- 候補クリックで 切る→残す に切り替わり、その位置を再生する ---
   b2030.onclick({ stopPropagation(){} });
@@ -103,7 +113,7 @@ const tests = `
 
   // --- 保持ブロックのタップで、その範囲がカット対象になる ---
   b4045.onclick({ stopPropagation(){} });
-  assert.strictEqual(cutCandidates.length, 3, 'user cut created by tap');
+  assert.strictEqual(cutCandidates.length, 5, 'user cut created by tap');
   const uc = cutCandidates.find(c => c.source === 'user');
   assert(uc && uc.start === 40 && uc.end === 50 && uc.enabled === true, 'user cut = tapped block [40,50]');
   const b4050cut = byRange(40, 50);
@@ -116,7 +126,7 @@ const tests = `
   assert.strictEqual(uc.enabled, true, 'user cut toggled back on');
   console.log('OK   tap plain block to cut / tap again to keep');
 
-  // --- 「編集する」の送信内容: disabled_cuts と user_cuts が分かれて入る ---
+  // --- 「編集する」の送信内容: disabled_cuts / user_cuts / llm_cuts が分かれて入る ---
   jobId = 'testjob'; uploaded = true;
   await document.getElementById('runBtn').onclick();
   const call = _fetchCalls.find(c => c.url === '/api/process/testjob');
@@ -124,7 +134,8 @@ const tests = `
   const body = JSON.parse(call.opts.body);
   assert.deepStrictEqual(body.disabled_cuts, [[20, 30], [50, 55]], 'disabled_cuts: ' + JSON.stringify(body.disabled_cuts));
   assert.deepStrictEqual(body.user_cuts, [[40, 50]], 'user_cuts: ' + JSON.stringify(body.user_cuts));
-  console.log('OK   process payload (disabled_cuts / user_cuts)');
+  assert.deepStrictEqual(body.llm_cuts, [[60, 65]], 'llm_cuts: ' + JSON.stringify(body.llm_cuts));
+  console.log('OK   process payload (disabled_cuts / user_cuts / llm_cuts)');
 
   console.log('TIMELINE JS TEST OK');
 })().catch(e => { console.error(e); process.exit(1); });

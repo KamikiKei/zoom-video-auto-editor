@@ -221,6 +221,68 @@ def _keep_segments(silences, start, end, min_sec):
     return keeps, cuts
 
 
+# ---------------------------------------------------------------------------
+# デフォルト保持ポリシー (登壇者以外はカット候補にする)
+# ---------------------------------------------------------------------------
+# 名前に含まれていたら運営 (ホスト) らしいとみなす語。
+# 実際のZoomアカウント名「松尾研 講義コミュニティ運営」もこれで拾える。
+_OPS_NAME_HINTS = ("運営", "ホスト", "司会", "主催", "事務局", "スタッフ",
+                   "コミュニティ", "host", "Host", "HOST", "MC")
+
+
+def _policy_candidates(speakers, cues, presenters, start, end):
+    """登壇者 (presenters) 以外の話者の発話区間をカット候補にする。
+
+    候補は {"start", "end", "kind": "speaker", "source": "ops"|"other",
+    "speaker", "speaker_name", "reason"} のリスト (enabled は呼び出し側)。
+    運営 (ホスト) らしい話者は source="ops"、それ以外の非登壇者
+    (質疑の参加者など) は source="other" に分ける。判定材料は:
+      - 紹介発言 (ご紹介します等) をした話者 = 運営
+      - 名前に運営らしい語 (_OPS_NAME_HINTS) を含む話者 = 運営
+    同一話者の近接区間 (間隔2秒以内) は1つの候補にまとめる。
+    """
+    if not speakers or not presenters:
+        return []
+    names = speakers.get("names") or {}
+    intro_names = set()
+    if cues:
+        from transcript import _INTRO_PATTERNS
+        for c in cues:
+            if c.get("speaker") and any(
+                    p.search(c.get("text") or "") for p in _INTRO_PATTERNS):
+                intro_names.add(c["speaker"])
+    wanted = {int(p) for p in presenters}
+    raw = []
+    for seg in speakers.get("segments", []):
+        sp = int(seg["speaker"])
+        if sp in wanted:
+            continue
+        s = max(float(seg["start"]), float(start))
+        e = min(float(seg["end"]), float(end))
+        if e - s > 0.05:
+            raw.append([s, e, sp])
+    merged = []
+    for s, e, sp in sorted(raw):
+        if merged and merged[-1][2] == sp and s - merged[-1][1] <= 2.0:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e, sp])
+    out = []
+    for s, e, sp in merged:
+        name = names.get(str(sp)) or f"話者{sp + 1}"
+        is_ops = name in intro_names or any(h in name for h in _OPS_NAME_HINTS)
+        if is_ops:
+            reason = f"運営（{name}）の発話 — デフォルトでは登壇者のみ残す"
+        else:
+            reason = f"登壇者以外の発話（{name}） — デフォルトでは登壇者のみ残す"
+        out.append({
+            "start": round(s, 3), "end": round(e, 3),
+            "kind": "speaker", "source": "ops" if is_ops else "other",
+            "speaker": sp, "speaker_name": name, "reason": reason,
+        })
+    return out
+
+
 def _suggest_start(speakers, presenters):
     """指定された登壇者 (複数可) のうち、最初に話し始める位置を返す。
 
@@ -319,11 +381,19 @@ def _asset_timing(asset_type, asset_info, cfg):
 # ---------------------------------------------------------------------------
 # plan: カット案の計算 (書き出しはしない)
 # ---------------------------------------------------------------------------
-def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None) -> dict:
+def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None,
+                 llm_client=None) -> dict:
     """動画 (+任意でZoom VTT) と設定からカット案 dict を作る。
 
-    含まれるもの: 開始点 (trim_start) と終了点、無音カット後の保持区間、
+    含まれるもの: 開始点 (trim_start) と終了点、カット後の保持区間、
     話者・登壇者推定 (VTTがある場合)、素材情報、想定の出力尺。
+
+    カット候補は candidates に集められ、有効なものだけが保持区間から
+    差し引かれる。候補の出所 (source) は:
+      silence: 無音検出 / ops・other: デフォルト保持ポリシー (登壇者以外)
+      llm: LLM検出 (llm_detect) / user: 人間が付けたカット
+    llm_client が渡されれば LLM検出も行い、結果 (ok/skipped/failed) は
+    plan["llm_detection"] に記録する。失敗しても plan は作り続ける。
     """
     input_video = Path(input_video)
     info = probe(input_video)
@@ -339,10 +409,12 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None)
 
     # --- 話者・登壇者推定 (Zoom文字起こしがある場合) ---
     speakers = None
+    cues = []
     if transcript_path:
         sys.path.insert(0, str(Path(__file__).parent))
-        from transcript import result_from_transcript
-        speakers = result_from_transcript(Path(transcript_path))
+        from transcript import build_result, parse_transcript
+        cues = parse_transcript(Path(transcript_path))
+        speakers = build_result(cues)
 
     # --- 登壇者 (複数可) ---
     # cfg["presenters"] で話者インデックスを複数指定できる。未指定なら
@@ -386,41 +458,78 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None)
         raise ValueError(
             f"本編が0秒以下です (total={total:.1f}s, start={trim_start}, end={end})")
 
-    # --- カット (無音カット + ユーザーカット) ---
-    # 検出された無音はすべて candidates として plan に残し、
+    # --- カット候補 (無音 / 保持ポリシー / LLM検出 / ユーザー) ---
+    # 検出された区間はすべて candidates として plan に残し、
     # cfg["disabled_cuts"] ([[start, end], ...]) に入った区間は
-    # 「切らない (残す)」として keeps 側に回す。人間がエディタで
+    # 「切らない (残す)」として候補を無効化する。人間がエディタで
     # 区間ごとに残す/切るを切り替えるための仕組み。
-    # cfg["user_cuts"] ([[start, end], ...]) は、人間が保持区間から
-    # 追加で切りたい区間。candidates には source: "user" で入り、
-    # keeps から差し引かれる (無音カットが OFF でも有効)。
+    # cfg["user_cuts"] / cfg["llm_cuts"] ([[start, end], ...]) は、
+    # エディタ側で確定した明示のカット区間 (人間が付けたカット /
+    # 人間が有効のままにしたLLM候補) で、keeps から差し引かれる。
     min_sec = float(cfg.get("silence_sec", 3.0))
     db = int(cfg.get("silence_db", -38))
     sil_enabled = bool(cfg.get("silence_cut", False)) and has_audio
+    disabled = cfg.get("disabled_cuts") or []
+
+    def _is_disabled(c):
+        # クリップで開始/終了がずれた区間とも一致するよう、
+        # 区間長の半分以上が重なっていれば「残す」指定とみなす
+        for d in disabled:
+            overlap = min(c[1], float(d[1])) - max(c[0], float(d[0]))
+            if overlap >= 0.5 * (c[1] - c[0]):
+                return True
+        return False
+
     candidates = []
     cuts = []
+
+    def _add_candidate(cand):
+        cand = dict(cand)
+        cand["enabled"] = not _is_disabled((cand["start"], cand["end"]))
+        candidates.append(cand)
+        if cand["enabled"]:
+            cuts.append((cand["start"], cand["end"]))
+
+    # 無音カット
     if sil_enabled:
         _all_keeps, cuts_all = _keep_segments(
             detect_silences(input_video, min_sec, db), trim_start, end, min_sec)
-        disabled = cfg.get("disabled_cuts") or []
-
-        def _is_disabled(c):
-            # クリップで開始/終了がずれた区間とも一致するよう、
-            # 区間長の半分以上が重なっていれば「残す」指定とみなす
-            for d in disabled:
-                overlap = min(c[1], float(d[1])) - max(c[0], float(d[0]))
-                if overlap >= 0.5 * (c[1] - c[0]):
-                    return True
-            return False
-
         for c in cuts_all:
-            enabled = not _is_disabled(c)
-            candidates.append({"start": round(c[0], 3), "end": round(c[1], 3),
-                               "kind": "silence", "source": "silence",
-                               "enabled": enabled})
-            if enabled:
-                cuts.append(c)
-    # ユーザーカット: [trim_start, end] に収まるものだけ有効
+            _add_candidate({"start": round(c[0], 3), "end": round(c[1], 3),
+                            "kind": "silence", "source": "silence"})
+
+    # デフォルト保持ポリシー: 登壇者以外の発話を最初からカット候補にする。
+    # cfg["keep_presenters_only"] = False で無効化できる。
+    keep_presenters_only = bool(cfg.get("keep_presenters_only", True))
+    policy_applied = False
+    if keep_presenters_only and speakers and presenters:
+        for cand in _policy_candidates(speakers, cues, presenters,
+                                       trim_start, end):
+            _add_candidate(cand)
+            policy_applied = True
+
+    # LLM検出 (transcript のもたつき・トラブル・本題外)
+    llm_status = {"status": "skipped", "detail": "LLMクライアント未指定"}
+    if llm_client is not None:
+        if cues:
+            try:
+                sys.path.insert(0, str(Path(__file__).parent))
+                import llm_detect
+                found = llm_detect.detect_ranges(cues, llm_client)
+                for cand in found:
+                    cs = max(cand["start"], trim_start)
+                    ce = min(cand["end"], end)
+                    if ce - cs > 0.05:
+                        _add_candidate({**cand, "start": round(cs, 3),
+                                        "end": round(ce, 3)})
+                llm_status = {"status": "ok", "count": len(found),
+                              "client": getattr(llm_client, "name", "unknown")}
+            except Exception as e:  # noqa: BLE001 - 検出失敗でも plan は作る
+                llm_status = {"status": "failed", "detail": str(e)[:200]}
+        else:
+            llm_status = {"status": "skipped", "detail": "transcript がありません"}
+
+    # 明示カット (ユーザー / LLM): [trim_start, end] に収まるものだけ有効
     user_cuts = []
     for u in cfg.get("user_cuts") or []:
         us, ue = max(float(u[0]), trim_start), min(float(u[1]), end)
@@ -428,6 +537,15 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None)
             user_cuts.append((us, ue))
             candidates.append({"start": round(us, 3), "end": round(ue, 3),
                                "kind": "user", "source": "user",
+                               "enabled": True})
+            cuts.append((us, ue))
+    llm_cuts = []
+    for u in cfg.get("llm_cuts") or []:
+        us, ue = max(float(u[0]), trim_start), min(float(u[1]), end)
+        if ue - us > 0.05:
+            llm_cuts.append((us, ue))
+            candidates.append({"start": round(us, 3), "end": round(ue, 3),
+                               "kind": "llm", "source": "llm",
                                "enabled": True})
             cuts.append((us, ue))
     candidates.sort(key=lambda c: c["start"])
@@ -479,12 +597,18 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None)
         "trim_start_source": trim_source,
         "speakers": speakers,
         "presenters": presenters,
+        "keep_policy": {
+            "keep_presenters_only": keep_presenters_only,
+            "applied": policy_applied,
+        },
+        "llm_detection": llm_status,
         "silence": {
             "enabled": sil_enabled,
             "min_sec": min_sec,
             "db": db,
             "cuts": [[round(s, 3), round(e, 3)] for s, e in cuts],
             "user_cuts": [[round(s, 3), round(e, 3)] for s, e in user_cuts],
+            "llm_cuts": [[round(s, 3), round(e, 3)] for s, e in llm_cuts],
             "candidates": candidates,
             "keeps": [[round(s, 3), round(e, 3)] for s, e in keeps],
         },
@@ -525,7 +649,10 @@ def _render_one_pass(plan, thumb, output, cfg, enc_args, progress_cb):
 
     filters = []
     # --- 映像: OP / 本編 (保持区間をつなぐ) / ED ---
-    filters.append(f"[0:v]{scale},trim=duration={intro},setpts=PTS-STARTPTS[v0]")
+    # xfade は入力同士のタイムベース一致を要求する。素材側は fps フィルタで
+    # 1/fps になる一方、本編 concat は保持区間が1個のとき 1/1000000 になる
+    # ことがあり不一致で失敗するため、xfade の全入力を settb=AVTB で統一する。
+    filters.append(f"[0:v]{scale},trim=duration={intro},setpts=PTS-STARTPTS,settb=AVTB[v0]")
     for i, (a, b) in enumerate(keeps):
         filters.append(f"[1:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{scale}[vk{i}]")
     if joins:
@@ -534,11 +661,11 @@ def _render_one_pass(plan, thumb, output, cfg, enc_args, progress_cb):
             d, off = joins[k - 1]
             filters.append(f"[{cur}][vk{k}]xfade=transition=fade:duration={d:.3f}:offset={off:.3f}[vx{k}]")
             cur = f"vx{k}"
-        filters.append(f"[{cur}]null[vmain]")
+        filters.append(f"[{cur}]settb=AVTB[vmain]")
     else:
         labels = "".join(f"[vk{i}]" for i in range(len(keeps)))
-        filters.append(labels + f"concat=n={len(keeps)}:v=1:a=0[vmain]")
-    filters.append(f"[2:v]{scale},trim=duration={outro},setpts=PTS-STARTPTS[v2]")
+        filters.append(labels + f"concat=n={len(keeps)}:v=1:a=0,settb=AVTB[vmain]")
+    filters.append(f"[2:v]{scale},trim=duration={outro},setpts=PTS-STARTPTS,settb=AVTB[v2]")
     filters.append(f"[v0][vmain]xfade=transition=fade:duration={dissolve}:offset={offset1}[vx]")
     filters.append(f"[vx][v2]xfade=transition=fade:duration={dissolve}:offset={offset2}[vout]")
 
@@ -689,7 +816,10 @@ def _render_legacy(plan, thumb, output, cfg, enc_args, progress_cb):
     main_start, main_end = trim_start, end
     base_pct, span_pct = 0, 100
     tmp_cut = None
-    if plan["silence"]["enabled"] and not single:
+    # 保持区間が範囲全体と異なる場合は、その出所 (無音 / 保持ポリシー /
+    # LLM / ユーザー) によらず本編カットを作る。以前は無音カット有効時の
+    # みだったため、他方式のカットがフォールバック時に落ちていた。
+    if not single:
         tmp_cut = output.with_name(output.stem + "_maincut.mp4")
         _build_main_cut(video, keeps, width, height, fps, tmp_cut,
                         max(10, crf - 3), preset, progress_cb, main_dur,
@@ -743,11 +873,12 @@ def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict, progr
     cfg に "transcript" (VTTパス) があれば開始点候補に使う。"""
     cfg = dict(cfg or {})
     plan = compute_plan(Path(input_video), cfg,
-                        transcript_path=cfg.get("transcript"), thumb=Path(thumb))
+                        transcript_path=cfg.get("transcript"), thumb=Path(thumb),
+                        llm_client=cfg.get("llm_client"))
     cuts = plan["silence"]["cuts"]
     if cuts:
         removed = sum(e - s for s, e in cuts)
-        print(f"  カット: {len(cuts)}箇所 / 合計 {removed:.1f}秒を除去 (無音+手動)")
+        print(f"  カット: {len(cuts)}箇所 / 合計 {removed:.1f}秒を除去 (有効な候補すべて)")
     render_plan(plan, Path(output), cfg=cfg, thumb=Path(thumb), progress_cb=progress_cb)
 
 
@@ -787,6 +918,12 @@ def _plan_cli(argv):
     ap.add_argument("--silence-sec", type=float, help="無音カットの最小秒数 (既定3)")
     ap.add_argument("--silence-db", type=int, help="無音判定のしきい値 dB (既定-38)")
     ap.add_argument("--presenters", help="登壇者の話者インデックス (カンマ区切り、複数可。例: 0,1)")
+    ap.add_argument("--no-keep-presenters-only", action="store_true",
+                    help="デフォルト保持ポリシー (登壇者以外をカット候補にする) を無効化")
+    ap.add_argument("--llm-detect", action="store_true",
+                    help="LLM検出を行う (クライアントは環境変数から選択: llm_detect.get_client_from_env)")
+    ap.add_argument("--mock-llm", action="store_true",
+                    help="LLM検出にモッククライアントを使う (テスト・デモ用)")
     args = ap.parse_args(argv)
 
     cfg = _load_cfg(args)
@@ -799,10 +936,23 @@ def _plan_cli(argv):
         cfg["presenters"] = [int(x) for x in args.presenters.split(",") if x.strip()]
     if args.silence_cut:
         cfg["silence_cut"] = True
+    if args.no_keep_presenters_only:
+        cfg["keep_presenters_only"] = False
+
+    llm_client = None
+    if args.mock_llm:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import llm_detect
+        llm_client = llm_detect.MockLLMClient()
+    elif args.llm_detect:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import llm_detect
+        llm_client = llm_detect.get_client_from_env()
 
     plan = compute_plan(Path(args.video), cfg,
                         transcript_path=args.transcript,
-                        thumb=Path(args.thumb) if args.thumb else None)
+                        thumb=Path(args.thumb) if args.thumb else None,
+                        llm_client=llm_client)
     text = json.dumps(plan, ensure_ascii=False, indent=2)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
@@ -814,7 +964,14 @@ def _plan_cli(argv):
             print(f"  登壇者推定: {sp.get('main_speaker_guess')} "
                   f"(名前: {sp.get('names')}) / 話者別秒数: {sp.get('speakers')}")
         if plan["silence"]["cuts"]:
-            print(f"  無音カット: {len(plan['silence']['cuts'])}箇所")
+            print(f"  カット: {len(plan['silence']['cuts'])}箇所 (有効な候補すべて)")
+        by_src = {}
+        for c in plan["silence"]["candidates"]:
+            if c.get("enabled"):
+                by_src[c.get("source", "?")] = by_src.get(c.get("source", "?"), 0) + 1
+        if by_src:
+            print(f"  候補の内訳 (有効): {by_src}")
+        print(f"  LLM検出: {plan['llm_detection']}")
     else:
         print(text)
 

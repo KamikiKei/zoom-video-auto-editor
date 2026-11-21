@@ -23,6 +23,7 @@ rm -f pipeline/demo_state.json
 python3 pipeline/make_demo_assets.py
 
 unset SLACK_WEBHOOK_URL   # デモはコンソール通知で
+export LLM_DETECT=mock    # デモのAI検出はモックで決定的に
 python3 -m pipeline.daemon --once --demo \
   --inbox pipeline/demo_inbox \
   --outbox pipeline/demo_outbox \
@@ -40,6 +41,12 @@ assert rec["youtube_url"].startswith("https://mock-youtube.example.invalid/"), r
 job = Path("jobs") / rec["job_id"]
 assert (job / "output.mp4").exists(), job
 assert list(Path("pipeline/demo_outbox").glob("*.mp4")), "outbox に動画が無い"
+plan = json.loads((job / "plan.json").read_text(encoding="utf-8"))
+srcs = {c["source"] for c in plan["silence"]["candidates"]}
+assert "llm" in srcs, f"AI検出候補が plan に無い: {srcs}"
+assert plan["llm_detection"]["status"] == "ok", plan["llm_detection"]
+assert plan["silence"]["keeps"] == [[9.0, 20.0], [24.5, 28.5], [33.5, 34.0]], plan["silence"]
+print("plan: AI検出候補あり (モック) / keeps:", plan["silence"]["keeps"])
 print("state: done / youtube_url:", rec["youtube_url"])
 print("editor url:", rec["editor_url"])
 print("job:", rec["job_id"])

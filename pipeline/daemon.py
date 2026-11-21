@@ -28,6 +28,9 @@
   SLACK_WEBHOOK_URL あれば Webhook 通知、無ければコンソール通知
   ZOOM_CLIENT_ID   あれば Zoom 実接続 (未実装スタブ)
   YOUTUBE_CLIENT_SECRETS あれば YouTube 実接続 (未実装スタブ)
+  GEMINI_API_KEY / GOOGLE_API_KEY あれば LLM検出 (もたつき・トラブル) が有効
+  GEMINI_MODEL     LLM検出のモデル (既定 gemini-2.5-flash)
+  LLM_DETECT       "mock" でモック検出、"off" でLLM検出を無効化
 """
 import argparse
 import os
@@ -37,6 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import llm_detect  # noqa: E402
 from pipeline import description, editor_bridge  # noqa: E402
 from pipeline.notify import get_notifier  # noqa: E402
 from pipeline.state import State  # noqa: E402
@@ -61,6 +65,11 @@ class Pipeline:
         self.work_dir = Path(work_dir)
         self.editor_base_url = editor_base_url
         self.demo = demo
+        # LLM検出クライアント (キーが無ければ None = スキップ。
+        # デモではモックになり、候補が付くところまで通る)
+        self.llm_client = llm_detect.get_client_from_env(demo=demo)
+        print(f"[pipeline] LLM検出: "
+              f"{getattr(self.llm_client, 'name', 'なし (スキップ)')}")
 
     # -- 工程10〜11: 書き出し済みジョブの後段 --
     def _finish_job(self, rec_id: str, rec_state: dict) -> None:
@@ -100,7 +109,7 @@ class Pipeline:
             return
         job_id, _job_dir, plan = editor_bridge.create_editor_job(
             local.video, transcript=local.transcript, asset=local.asset,
-            meta=meta)
+            meta=meta, llm_client=self.llm_client)
         url = editor_bridge.editor_url(self.editor_base_url, job_id)
         summary = editor_bridge.plan_summary(plan)
         title_for_msg = description.build_title(meta) or local.title or rec.id

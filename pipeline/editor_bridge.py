@@ -42,10 +42,14 @@ def jobs_dir() -> Path:
 
 def create_editor_job(video: Path, transcript: Path | None = None,
                       asset: Path | None = None, cfg: dict | None = None,
-                      meta: dict | None = None) -> tuple[str, Path, dict]:
+                      meta: dict | None = None,
+                      llm_client=None) -> tuple[str, Path, dict]:
     """ジョブを作成し (job_id, job_dir, plan) を返す。
 
     開始点は VTT の登壇者推定 (edit.compute_plan) が自動で入れる。
+    デフォルト保持ポリシー (登壇者以外はカット候補) は compute_plan 側で
+    最初から効く。llm_client が渡されれば LLM検出 (もたつき・トラブル)
+    の候補も付き、結果は plan["llm_detection"] に記録される。
     素材が無い場合は plan の asset が None になり、書き出し時に
     エディタ側で素材を指定する必要がある。
     """
@@ -68,7 +72,8 @@ def create_editor_job(video: Path, transcript: Path | None = None,
         shutil.copy2(asset, thumb)
 
     plan = edit_mod.compute_plan(input_video, cfg,
-                                 transcript_path=vtt, thumb=thumb)
+                                 transcript_path=vtt, thumb=thumb,
+                                 llm_client=llm_client)
     (d / "plan.json").write_text(
         json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -129,6 +134,19 @@ def plan_summary(plan: dict) -> str:
     cuts = (plan.get("silence") or {}).get("cuts") or []
     if cuts:
         removed = sum(e - s for s, e in cuts)
-        parts.append(f"無音カット {len(cuts)}箇所 (合計 {removed:.0f}秒)")
+        parts.append(f"カット {len(cuts)}箇所 (合計 {removed:.0f}秒)")
+    cands = (plan.get("silence") or {}).get("candidates") or []
+    by_src = {}
+    for c in cands:
+        if c.get("enabled"):
+            by_src[c.get("source", "?")] = by_src.get(c.get("source", "?"), 0) + 1
+    labels = {"silence": "無音", "ops": "運営", "other": "登壇者以外",
+              "llm": "AI検出", "user": "手動"}
+    if by_src:
+        parts.append("候補内訳: " + "・".join(
+            f"{labels.get(k, k)}{v}件" for k, v in sorted(by_src.items())))
+    llm = plan.get("llm_detection") or {}
+    if llm.get("status") == "failed":
+        parts.append("AI検出は失敗したため候補なしで続行")
     parts.append(f"想定の長さ {fmt(plan['expected_duration'])}")
     return " / ".join(parts)
