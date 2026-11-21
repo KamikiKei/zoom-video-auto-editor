@@ -20,10 +20,27 @@ Zoomアーカイブ動画 自動編集パイプライン
   # フォルダ内まとめて (input/*.mp4 + input/thumb.png -> output/)
   python3 edit.py --batch --config config.json
 
+  # カット案だけを作る (書き出さない)。Zoom文字起こしがあれば開始点候補も入る
+  python3 edit.py plan --video input.mp4 --transcript meeting.vtt \
+      --thumb thumb.png --silence-cut --out plan.json
+
+  # カット案から書き出す
+  python3 edit.py render --plan plan.json -o output.mp4
+
 OP/EDの切り方:
   --trim-start : 頭から何秒カットするか
   --trim-tail  : 末尾から何秒カットするか
   --end        : こちらを直接指定も可 (秒 or HH:MM:SS)。--trim-tailより優先
+
+エンコーダ:
+  cfg の "encoder" で "auto" (既定) / "x264" / "nvenc" を選べる。
+  auto のときは h264_nvenc が実際に使えるか小さな試しエンコードで確認し、
+  使えれば NVENC、だめなら libx264 にフォールバックする。
+
+書き出し方式:
+  既定は1パス (無音カットの保持区間も含め単一フィルタグラフで1回だけ
+  エンコード)。失敗した場合は従来の中間ファイル方式 (2パス) に自動で
+  フォールバックする。cfg "one_pass": false で従来方式を強制できる。
 """
 import argparse
 import json
@@ -111,6 +128,61 @@ def _run_ffmpeg(cmd, expected, progress_cb=None, base_pct=0, span_pct=100):
         raise RuntimeError(f"ffmpeg が失敗しました: {tail.strip()[-300:]}")
 
 
+# ---------------------------------------------------------------------------
+# エンコーダ抽象化 (libx264 / NVENC)
+# ---------------------------------------------------------------------------
+_NVENC_CACHE = {}
+
+
+def _nvenc_available() -> bool:
+    """h264_nvenc が「一覧にある」だけでなく「実際にエンコードできる」かを確認する。
+    GPUの無い環境では一覧にあっても試しエンコードが失敗するので、必ず実働確認する。"""
+    if "ok" in _NVENC_CACHE:
+        return _NVENC_CACHE["ok"]
+    ok = False
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                           capture_output=True, text=True, timeout=30)
+        if "h264_nvenc" in (r.stdout or ""):
+            t = subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=black:s=256x256:r=30:d=0.5",
+                 "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, timeout=60)
+            ok = t.returncode == 0
+    except Exception:  # noqa: BLE001
+        ok = False
+    _NVENC_CACHE["ok"] = ok
+    return ok
+
+
+def _encoder_args(cfg):
+    """cfg から (ffmpegの映像エンコーダ引数, 表示名) を返す。
+
+    encoder: "auto" (既定) / "x264" / "nvenc"
+      - auto: NVENCが実働すれば NVENC、だめなら libx264
+      - nvenc: 実働しなければ RuntimeError (明示指定なので黙って落とさない)
+    NVENC時は libx264 crf 18〜20 相当を狙い -preset p4 / -rc vbr / -cq 21 を使う。
+    """
+    enc = str(cfg.get("encoder", "auto")).lower()
+    if enc not in ("auto", "x264", "nvenc"):
+        raise ValueError(f"encoder の値が不正です: {enc} (auto / x264 / nvenc)")
+    if enc == "nvenc" and not _nvenc_available():
+        raise RuntimeError(
+            "h264_nvenc が使える環境ではありません (GPU・ドライバ・ffmpegを確認してください)")
+    if enc == "x264" or (enc == "auto" and not _nvenc_available()):
+        crf = int(cfg.get("crf", 18))
+        preset = str(cfg.get("preset", "fast"))
+        return ["-c:v", "libx264", "-crf", str(crf), "-preset", preset], "libx264"
+    cq = int(cfg.get("nvenc_cq", 21))
+    npreset = str(cfg.get("nvenc_preset", "p4"))
+    return (["-c:v", "h264_nvenc", "-preset", npreset,
+             "-rc", "vbr", "-cq", str(cq), "-b:v", "0"], "h264_nvenc")
+
+
+# ---------------------------------------------------------------------------
+# 無音検出と保持区間
+# ---------------------------------------------------------------------------
 def detect_silences(path: Path, min_sec=3.0, db=-38):
     """min_sec 以上の無音区間 [(start, end), ...] (絶対時刻) を返す"""
     result = subprocess.run(
@@ -149,34 +221,46 @@ def _keep_segments(silences, start, end, min_sec):
     return keeps, cuts
 
 
+def _join_plan(keeps, dissolve, fps):
+    """保持区間をつなぐ際の (ディゾルブ秒, xfade offset) のリストと、
+    つないだ後の本編長を返す。短い区間ではディゾルブを自動で短くする
+    (従来 _build_main_cut 内の計算と同一)。"""
+    total = sum(b - a for a, b in keeps)
+    joins = []
+    if len(keeps) < 2 or dissolve <= 0:
+        return joins, total
+    acc = keeps[0][1] - keeps[0][0]
+    for k in range(1, len(keeps)):
+        prev_len = keeps[k - 1][1] - keeps[k - 1][0]
+        seg_len = keeps[k][1] - keeps[k][0]
+        d = min(dissolve, 0.45 * prev_len, 0.45 * seg_len)
+        d = max(d, 1.0 / max(fps, 1))  # 最低1フレーム
+        d = min(d, seg_len * 0.9, acc * 0.9)
+        joins.append((d, acc - d))
+        acc = acc + seg_len - d
+    return joins, acc
+
+
 def _build_main_cut(input_video, keeps, width, height, fps, out_path,
                     crf, preset, progress_cb, main_dur, dissolve=0.0):
-    """無音を除いた本編だけの中間ファイルを作る。
-    つなぎ目にはディゾルブ (xfade/acrossfade) をかける。
-    短い区間ではディゾルブを自動で短くし、最低限の長さも確保する。"""
+    """無音を除いた本編だけの中間ファイルを作る (従来方式・フォールバック用)。
+    つなぎ目にはディゾルブ (xfade/acrossfade) をかける。"""
     scale = f"scale={width}:{height}:force_original_aspect_ratio=disable,setsar=1,fps={fps},format=yuv420p"
     filters = []
     for i, (a, b) in enumerate(keeps):
         filters.append(f"[0:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{scale}[v{i}]")
         filters.append(f"[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a{i}]")
-    if len(keeps) == 1 or dissolve <= 0:
+    joins, _ = _join_plan(keeps, dissolve, fps)
+    if not joins:
         labels = "".join(f"[v{i}][a{i}]" for i in range(len(keeps)))
         filters.append(labels + f"concat=n={len(keeps)}:v=1:a=1[v][a]")
     else:
-        # 区間をつないだ累積長を管理しながら xfade をチェーンする
         cur_v, cur_a = "v0", "a0"
-        acc = keeps[0][1] - keeps[0][0]
         for k in range(1, len(keeps)):
-            prev_len = keeps[k - 1][1] - keeps[k - 1][0]
-            seg_len = keeps[k][1] - keeps[k][0]
-            d = min(dissolve, 0.45 * prev_len, 0.45 * seg_len)
-            d = max(d, 1.0 / max(fps, 1))  # 最低1フレーム
-            d = min(d, seg_len * 0.9, acc * 0.9)
-            off = acc - d
+            d, off = joins[k - 1]
             filters.append(f"[{cur_v}][v{k}]xfade=transition=fade:duration={d:.3f}:offset={off:.3f}[vx{k}]")
             filters.append(f"[{cur_a}][a{k}]acrossfade=d={d:.3f}[ax{k}]")
             cur_v, cur_a = f"vx{k}", f"ax{k}"
-            acc = acc + seg_len - d
         filters.append(f"[{cur_v}]null[v]")
         filters.append(f"[{cur_a}]anull[a]")
     cmd = ["ffmpeg", "-y", "-i", str(input_video),
@@ -187,109 +271,278 @@ def _build_main_cut(input_video, keeps, width, height, fps, out_path,
     _run_ffmpeg(cmd, main_dur, progress_cb, base_pct=0, span_pct=30)
 
 
-def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict, progress_cb=None):
+# ---------------------------------------------------------------------------
+# 素材 (OP/ED) の解決
+# ---------------------------------------------------------------------------
+def _resolve_asset(thumb: Path, cfg: dict):
+    """(asset_type, probe結果 or None) を返す。asset_type 未指定なら自動判定。"""
+    asset_type = cfg.get("asset_type")
+    info = None
+    if asset_type is None:
+        try:
+            info = probe(thumb)
+            asset_type = "video"
+        except Exception:  # noqa: BLE001
+            asset_type = "image"
+    elif asset_type == "video":
+        info = probe(thumb)
+    return asset_type, info
+
+
+def _asset_timing(asset_type, asset_info, cfg):
+    """(intro秒, outro秒, 素材に音声があるか) を返す。
+    動画素材はそのままの長さで頭とお尻に付ける。"""
+    if asset_type == "video":
+        dur = float(asset_info["format"]["duration"])
+        has_audio = any(s["codec_type"] == "audio" for s in asset_info["streams"])
+        return dur, dur, has_audio
+    return float(cfg.get("intro_sec", 3)), float(cfg.get("outro_sec", 3)), False
+
+
+# ---------------------------------------------------------------------------
+# plan: カット案の計算 (書き出しはしない)
+# ---------------------------------------------------------------------------
+def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None) -> dict:
+    """動画 (+任意でZoom VTT) と設定からカット案 dict を作る。
+
+    含まれるもの: 開始点 (trim_start) と終了点、無音カット後の保持区間、
+    話者・登壇者推定 (VTTがある場合)、素材情報、想定の出力尺。
+    """
+    input_video = Path(input_video)
     info = probe(input_video)
     vstream = next(s for s in info["streams"] if s["codec_type"] == "video")
     has_audio = any(s["codec_type"] == "audio" for s in info["streams"])
     width = int(vstream["width"])
     height = int(vstream["height"])
-    # fps: "30/1" 形式を評価
     num, _, den = str(vstream.get("r_frame_rate", "30/1")).partition("/")
     fps = float(num) / float(den or 1)
     if fps <= 0 or fps > 120:
         fps = 30.0
     total = float(info["format"]["duration"])
 
-    trim_start = parse_time(cfg.get("trim_start", 0))
+    # --- 話者・登壇者推定 (Zoom文字起こしがある場合) ---
+    speakers = None
+    if transcript_path:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from transcript import result_from_transcript
+        speakers = result_from_transcript(Path(transcript_path))
+
+    # --- 開始点・終了点 ---
+    if cfg.get("trim_start") is not None:
+        trim_start = parse_time(cfg["trim_start"])
+        trim_source = "config"
+    elif speakers and speakers.get("suggested_trim_start") is not None:
+        trim_start = float(speakers["suggested_trim_start"])
+        trim_source = "transcript"
+    else:
+        trim_start = 0.0
+        trim_source = "default"
     if cfg.get("end") is not None:
         end = parse_time(cfg["end"])
     else:
         end = total - parse_time(cfg.get("trim_tail", 0))
-    main_dur = end - trim_start
-    if main_dur <= 0:
-        raise ValueError(f"本編が0秒以下です (total={total:.1f}s, start={trim_start}, end={end})")
+    if end - trim_start <= 0:
+        raise ValueError(
+            f"本編が0秒以下です (total={total:.1f}s, start={trim_start}, end={end})")
 
+    # --- 無音カット ---
+    min_sec = float(cfg.get("silence_sec", 3.0))
+    db = int(cfg.get("silence_db", -38))
+    sil_enabled = bool(cfg.get("silence_cut", False)) and has_audio
+    if sil_enabled:
+        keeps, cuts = _keep_segments(
+            detect_silences(input_video, min_sec, db), trim_start, end, min_sec)
+        if not keeps:
+            raise ValueError("無音カット後に残る区間がありません")
+    else:
+        keeps, cuts = [(trim_start, end)], []
+
+    # --- 素材情報 ---
+    asset = None
+    if thumb is not None:
+        thumb = Path(thumb)
+        asset_type, asset_info = _resolve_asset(thumb, cfg)
+        asset = {"path": str(thumb.resolve()), "type": asset_type}
+        if asset_info is not None:
+            asset["duration"] = float(asset_info["format"]["duration"])
+            asset["has_audio"] = any(
+                s["codec_type"] == "audio" for s in asset_info["streams"])
+
+    # --- 想定の出力尺 ---
     dissolve = float(cfg.get("dissolve", 0.8))
-    crf = int(cfg.get("crf", 18))
-    preset = cfg.get("preset", "fast")
-
-    # --- OP/ED素材の種類 (画像 or 動画) ---
-    asset_type = cfg.get("asset_type")
-    asset_info = None
-    if asset_type is None:
-        try:
-            asset_info = probe(thumb)
-            asset_type = "video"
-        except Exception:  # noqa: BLE001
-            asset_type = "image"
-    elif asset_type == "video":
-        asset_info = probe(thumb)
-    if asset_type == "video":
-        # 動画素材はそのままの長さで頭とお尻に付ける
-        intro = outro = float(asset_info["format"]["duration"])
-        asset_has_audio = any(s["codec_type"] == "audio" for s in asset_info["streams"])
+    if asset and asset["type"] == "video":
+        intro = outro = asset["duration"]
     else:
         intro = float(cfg.get("intro_sec", 3))
         outro = float(cfg.get("outro_sec", 3))
-        asset_has_audio = False
+    _, main_len = _join_plan(keeps, dissolve, fps)
+    expected = intro + main_len + outro - 2 * dissolve
 
-    # --- 無音カット (本編の中間ファイルを作る) ---
-    main_input = input_video
-    main_start, main_end = trim_start, end
-    base_pct, span_pct = 0, 100
-    tmp_cut = None
-    if cfg.get("silence_cut", False) and has_audio:
-        min_sec = float(cfg.get("silence_sec", 3.0))
-        db = int(cfg.get("silence_db", -38))
-        keeps, cuts = _keep_segments(detect_silences(input_video, min_sec, db),
-                                     trim_start, end, min_sec)
-        if cuts:
-            tmp_cut = output.with_name(output.stem + "_maincut.mp4")
-            _build_main_cut(input_video, keeps, width, height, fps, tmp_cut,
-                            max(10, crf - 3), preset, progress_cb, main_dur,
-                            dissolve=dissolve)
-            main_input = tmp_cut
-            main_start = 0.0
-            main_end = float(probe(tmp_cut)["format"]["duration"])
-            base_pct, span_pct = 30, 70
-            removed = sum(e - s for s, e in cuts)
-            print(f"  無音カット: {len(cuts)}箇所 / 合計 {removed:.1f}秒を除去")
-    main_dur2 = main_end - main_start
+    return {
+        "version": 1,
+        "video": {
+            "path": str(input_video.resolve()),
+            "duration": total,
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "has_audio": has_audio,
+        },
+        "trim_start": trim_start,
+        "end": end,
+        "trim_start_source": trim_source,
+        "speakers": speakers,
+        "silence": {
+            "enabled": sil_enabled,
+            "min_sec": min_sec,
+            "db": db,
+            "cuts": [[round(s, 3), round(e, 3)] for s, e in cuts],
+            "keeps": [[round(s, 3), round(e, 3)] for s, e in keeps],
+        },
+        "asset": asset,
+        "render": {
+            "dissolve": dissolve,
+            "intro_sec": float(cfg.get("intro_sec", 3)),
+            "outro_sec": float(cfg.get("outro_sec", 3)),
+            "asset_type": cfg.get("asset_type"),
+        },
+        "expected_duration": round(expected, 2),
+    }
 
-    if dissolve >= intro or dissolve >= outro or dissolve >= main_dur2:
-        if tmp_cut:
-            tmp_cut.unlink(missing_ok=True)
+
+# ---------------------------------------------------------------------------
+# render: カット案からの書き出し
+# ---------------------------------------------------------------------------
+def _render_one_pass(plan, thumb, output, cfg, enc_args, progress_cb):
+    """保持区間のカット + OP/ED接続 + ディゾルブを単一フィルタグラフで行い、
+    エンコード1回で書き出す。"""
+    vinfo = plan["video"]
+    video = Path(vinfo["path"])
+    width, height, fps = vinfo["width"], vinfo["height"], vinfo["fps"]
+    has_audio = vinfo["has_audio"]
+    keeps = [tuple(k) for k in plan["silence"]["keeps"]]
+    dissolve = float(cfg.get("dissolve", 0.8))
+
+    asset_type, asset_info = _resolve_asset(thumb, cfg)
+    intro, outro, asset_has_audio = _asset_timing(asset_type, asset_info, cfg)
+
+    joins, main_len = _join_plan(keeps, dissolve, fps)
+    if dissolve >= intro or dissolve >= outro or dissolve >= main_len:
         raise ValueError("ディゾルブ秒数がクリップ長より長いです。dissolveを短くしてください")
 
-    # xfade の offset は「1本目のクリップ長 - ディゾルブ」
     offset1 = intro - dissolve
-    # 1回目合成後の長さ = intro + main - dissolve。その末尾 - dissolve が2回目の offset
-    offset2 = intro + main_dur2 - 2 * dissolve
-
+    offset2 = intro + main_len - 2 * dissolve
     scale = f"scale={width}:{height}:force_original_aspect_ratio=disable,setsar=1,fps={fps},format=yuv420p"
 
     filters = []
-    # --- 映像 ---
+    # --- 映像: OP / 本編 (保持区間をつなぐ) / ED ---
+    filters.append(f"[0:v]{scale},trim=duration={intro},setpts=PTS-STARTPTS[v0]")
+    for i, (a, b) in enumerate(keeps):
+        filters.append(f"[1:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{scale}[vk{i}]")
+    if joins:
+        cur = "vk0"
+        for k in range(1, len(keeps)):
+            d, off = joins[k - 1]
+            filters.append(f"[{cur}][vk{k}]xfade=transition=fade:duration={d:.3f}:offset={off:.3f}[vx{k}]")
+            cur = f"vx{k}"
+        filters.append(f"[{cur}]null[vmain]")
+    else:
+        labels = "".join(f"[vk{i}]" for i in range(len(keeps)))
+        filters.append(labels + f"concat=n={len(keeps)}:v=1:a=0[vmain]")
+    filters.append(f"[2:v]{scale},trim=duration={outro},setpts=PTS-STARTPTS[v2]")
+    filters.append(f"[v0][vmain]xfade=transition=fade:duration={dissolve}:offset={offset1}[vx]")
+    filters.append(f"[vx][v2]xfade=transition=fade:duration={dissolve}:offset={offset2}[vout]")
+
+    # --- 音声 ---
+    if asset_has_audio:
+        filters.append(f"[0:a]atrim=duration={intro},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a0]")
+        filters.append(f"[2:a]atrim=duration={outro},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a2]")
+    else:
+        filters.append("[3:a]asplit=2[sil1][sil2]")
+        filters.append(f"[sil1]atrim=duration={intro},asetpts=PTS-STARTPTS[a0]")
+        filters.append(f"[sil2]atrim=duration={outro},asetpts=PTS-STARTPTS[a2]")
+    if has_audio:
+        for i, (a, b) in enumerate(keeps):
+            filters.append(f"[1:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[ak{i}]")
+        if joins:
+            cur = "ak0"
+            for k in range(1, len(keeps)):
+                d, _off = joins[k - 1]
+                filters.append(f"[{cur}][ak{k}]acrossfade=d={d:.3f}[ax{k}]")
+                cur = f"ax{k}"
+            filters.append(f"[{cur}]anull[amain]")
+        else:
+            labels = "".join(f"[ak{i}]" for i in range(len(keeps)))
+            filters.append(labels + f"concat=n={len(keeps)}:v=0:a=1[amain]")
+    else:
+        filters.append(f"anullsrc=cl=stereo:r=48000,atrim=duration={main_len},asetpts=PTS-STARTPTS[amain]")
+    filters.append(f"[a0][amain]acrossfade=d={dissolve}[ax]")
+    filters.append(f"[ax][a2]acrossfade=d={dissolve}[aout]")
+
+    filter_complex = ";".join(filters)
+    silent_dur = intro + main_len + outro
+
+    if asset_type == "video":
+        asset_in = ["-i", str(thumb)]
+        asset_in_outro = asset_in
+    else:
+        asset_in = ["-loop", "1", "-framerate", str(fps), "-t", str(intro), "-i", str(thumb)]
+        asset_in_outro = ["-loop", "1", "-framerate", str(fps), "-t", str(outro), "-i", str(thumb)]
+    cmd = ["ffmpeg", "-y"]
+    cmd += asset_in
+    cmd += ["-i", str(video)]
+    cmd += asset_in_outro
+    cmd += [
+        "-f", "lavfi", "-t", str(silent_dur), "-i", "anullsrc=cl=stereo:r=48000",
+        "-filter_complex", filter_complex,
+        "-map", "[vout]", "-map", "[aout]",
+        *enc_args, "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        str(output),
+    ]
+    print("実行:", " ".join(cmd[:6]), "...")
+    print(f"  本編: 保持区間 {len(keeps)}個 (合計 {main_len:.1f}s) / "
+          f"intro {intro}s + outro {outro}s / dissolve {dissolve}s / 素材={asset_type} / 1パス")
+    expected = intro + main_len + outro - 2 * dissolve
+    _run_ffmpeg(cmd, expected, progress_cb, base_pct=0, span_pct=100)
+    final = probe(output)
+    print(f"  完了: {output} (長さ {float(final['format']['duration']):.1f}s, "
+          f"想定 {expected:.1f}s)")
+
+
+def _final_pass(main_input, main_start, main_end, thumb, asset_type, asset_info,
+                has_audio, width, height, fps, cfg, enc_args, output,
+                progress_cb, base_pct, span_pct):
+    """OP/ED接続の最終パス (従来方式)。main_input は本編ファイル (中間ファイル可)。"""
+    dissolve = float(cfg.get("dissolve", 0.8))
+    intro, outro, asset_has_audio = _asset_timing(asset_type, asset_info, cfg)
+    main_dur2 = main_end - main_start
+
+    if dissolve >= intro or dissolve >= outro or dissolve >= main_dur2:
+        raise ValueError("ディゾルブ秒数がクリップ長より長いです。dissolveを短くしてください")
+
+    offset1 = intro - dissolve
+    offset2 = intro + main_dur2 - 2 * dissolve
+    scale = f"scale={width}:{height}:force_original_aspect_ratio=disable,setsar=1,fps={fps},format=yuv420p"
+
+    filters = []
     filters.append(f"[0:v]{scale},trim=duration={intro},setpts=PTS-STARTPTS[v0]")
     filters.append(f"[1:v]trim=start={main_start}:end={main_end},setpts=PTS-STARTPTS,{scale}[v1]")
     filters.append(f"[2:v]{scale},trim=duration={outro},setpts=PTS-STARTPTS[v2]")
     filters.append(f"[v0][v1]xfade=transition=fade:duration={dissolve}:offset={offset1}[vx]")
     filters.append(f"[vx][v2]xfade=transition=fade:duration={dissolve}:offset={offset2}[vout]")
 
-    # --- 音声 ---
     if asset_has_audio:
-        # 動画素材の音声をそのまま使う (無音トラックは使わない)
         filters.append(f"[0:a]atrim=duration={intro},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a0]")
         filters.append(f"[2:a]atrim=duration={outro},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a2]")
     else:
-        # 無音トラック(入力3) を intro/outro 用に2つに分ける
         filters.append("[3:a]asplit=2[sil1][sil2]")
         filters.append(f"[sil1]atrim=duration={intro},asetpts=PTS-STARTPTS[a0]")
         filters.append(f"[sil2]atrim=duration={outro},asetpts=PTS-STARTPTS[a2]")
     if has_audio:
         filters.append(f"[1:a]atrim=start={main_start}:end={main_end},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a1]")
     else:
-        # 音声なし動画の場合は無音の本編を作る
         filters.append(f"anullsrc=cl=stereo:r=48000,atrim=duration={main_dur2},asetpts=PTS-STARTPTS[a1]")
     filters.append(f"[a0][a1]acrossfade=d={dissolve}[ax]")
     filters.append(f"[ax][a2]acrossfade=d={dissolve}[aout]")
@@ -299,18 +552,19 @@ def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict, progr
 
     if asset_type == "video":
         asset_in = ["-i", str(thumb)]
+        asset_in_outro = asset_in
     else:
         asset_in = ["-loop", "1", "-framerate", str(fps), "-t", str(intro), "-i", str(thumb)]
         asset_in_outro = ["-loop", "1", "-framerate", str(fps), "-t", str(outro), "-i", str(thumb)]
     cmd = ["ffmpeg", "-y"]
     cmd += asset_in
     cmd += ["-i", str(main_input)]
-    cmd += asset_in if asset_type == "video" else asset_in_outro
+    cmd += asset_in_outro
     cmd += [
         "-f", "lavfi", "-t", str(silent_dur), "-i", "anullsrc=cl=stereo:r=48000",
         "-filter_complex", filter_complex,
         "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
+        *enc_args, "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
         str(output),
@@ -319,17 +573,202 @@ def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict, progr
     print(f"  本編: {main_start:.1f}s 〜 {main_end:.1f}s (残り {main_dur2:.1f}s) / "
           f"intro {intro}s + outro {outro}s / dissolve {dissolve}s / 素材={asset_type}")
     expected = intro + main_dur2 + outro - 2 * dissolve
-    try:
-        _run_ffmpeg(cmd, expected, progress_cb, base_pct=base_pct, span_pct=span_pct)
-    finally:
-        if tmp_cut:
-            tmp_cut.unlink(missing_ok=True)
+    _run_ffmpeg(cmd, expected, progress_cb, base_pct=base_pct, span_pct=span_pct)
     final = probe(output)
     print(f"  完了: {output} (長さ {float(final['format']['duration']):.1f}s, "
           f"想定 {expected:.1f}s)")
 
 
+def _render_legacy(plan, thumb, output, cfg, enc_args, progress_cb):
+    """従来方式: 無音カット時は中間ファイルを作ってから最終パス (2パス)。"""
+    vinfo = plan["video"]
+    video = Path(vinfo["path"])
+    width, height, fps = vinfo["width"], vinfo["height"], vinfo["fps"]
+    has_audio = vinfo["has_audio"]
+    trim_start, end = float(plan["trim_start"]), float(plan["end"])
+    main_dur = end - trim_start
+    dissolve = float(cfg.get("dissolve", 0.8))
+    crf = int(cfg.get("crf", 18))
+    preset = str(cfg.get("preset", "fast"))
+    asset_type, asset_info = _resolve_asset(thumb, cfg)
+
+    keeps = [tuple(k) for k in plan["silence"]["keeps"]]
+    single = (len(keeps) == 1 and abs(keeps[0][0] - trim_start) < 0.01
+              and abs(keeps[0][1] - end) < 0.01)
+
+    main_input = video
+    main_start, main_end = trim_start, end
+    base_pct, span_pct = 0, 100
+    tmp_cut = None
+    if plan["silence"]["enabled"] and not single:
+        tmp_cut = output.with_name(output.stem + "_maincut.mp4")
+        _build_main_cut(video, keeps, width, height, fps, tmp_cut,
+                        max(10, crf - 3), preset, progress_cb, main_dur,
+                        dissolve=dissolve)
+        main_input = tmp_cut
+        main_start = 0.0
+        main_end = float(probe(tmp_cut)["format"]["duration"])
+        base_pct, span_pct = 30, 70
+    try:
+        _final_pass(main_input, main_start, main_end, thumb, asset_type, asset_info,
+                    has_audio, width, height, fps, cfg, enc_args, output,
+                    progress_cb, base_pct, span_pct)
+    finally:
+        if tmp_cut:
+            tmp_cut.unlink(missing_ok=True)
+
+
+def render_plan(plan: dict, output: Path, cfg: dict = None, thumb=None, progress_cb=None):
+    """カット案 dict から最終書き出しを行う。
+
+    cfg で上書きできるのは表示・品質系 (dissolve, intro_sec, outro_sec,
+    asset_type, crf, preset, encoder, one_pass) のみ。開始点・保持区間は
+    plan 側が正。
+    """
+    cfg = dict(cfg or {})
+    eff = dict(plan.get("render") or {})
+    for key in ("dissolve", "intro_sec", "outro_sec", "asset_type",
+                "crf", "preset", "encoder", "nvenc_cq", "nvenc_preset", "one_pass"):
+        if cfg.get(key) is not None:
+            eff[key] = cfg[key]
+    if thumb is None and plan.get("asset"):
+        thumb = plan["asset"]["path"]
+    if thumb is None:
+        raise ValueError("OP/ED素材 (thumb) が指定されていません")
+    thumb = Path(thumb)
+    output = Path(output)
+
+    enc_args, enc_name = _encoder_args(eff)
+    print(f"  エンコーダ: {enc_name}")
+    if eff.get("one_pass", True):
+        try:
+            _render_one_pass(plan, thumb, output, eff, enc_args, progress_cb)
+            return
+        except RuntimeError as e:
+            print(f"  1パス書き出しに失敗したため従来方式 (2パス) にフォールバックします: {e}")
+    _render_legacy(plan, thumb, output, eff, enc_args, progress_cb)
+
+
+def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict, progress_cb=None):
+    """従来互換のエントリポイント: カット案を作ってそのまま書き出す。
+    cfg に "transcript" (VTTパス) があれば開始点候補に使う。"""
+    cfg = dict(cfg or {})
+    plan = compute_plan(Path(input_video), cfg,
+                        transcript_path=cfg.get("transcript"), thumb=Path(thumb))
+    cuts = plan["silence"]["cuts"]
+    if cuts:
+        removed = sum(e - s for s, e in cuts)
+        print(f"  無音カット: {len(cuts)}箇所 / 合計 {removed:.1f}秒を除去")
+    render_plan(plan, Path(output), cfg=cfg, thumb=Path(thumb), progress_cb=progress_cb)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def _load_cfg(args) -> dict:
+    cfg = {}
+    if getattr(args, "config", None):
+        cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    return cfg
+
+
+def _overlay(cfg: dict, pairs):
+    for key, val in pairs:
+        if val is not None:
+            cfg[key] = val
+    return cfg
+
+
+def _plan_cli(argv):
+    ap = argparse.ArgumentParser(
+        prog="edit.py plan", description="カット案 (plan JSON) を作る。書き出しはしない")
+    ap.add_argument("--video", required=True, help="入力動画 mp4")
+    ap.add_argument("--transcript", help="Zoom文字起こし VTT (開始点候補・話者推定に使う)")
+    ap.add_argument("--thumb", help="OP/ED素材 (画像 or 動画)。素材情報を plan に含める")
+    ap.add_argument("--out", help="plan JSON の出力先 (省略時は標準出力)")
+    ap.add_argument("--config", help="設定ファイル (json)")
+    ap.add_argument("--trim-start", type=float, help="頭からカットする秒数 (OP)")
+    ap.add_argument("--trim-tail", type=float, help="末尾からカットする秒数 (ED)")
+    ap.add_argument("--end", help="本編の終了位置を直接指定 (秒 or HH:MM:SS)")
+    ap.add_argument("--intro-sec", type=float, help="頭サムネの表示秒数")
+    ap.add_argument("--outro-sec", type=float, help="お尻サムネの表示秒数")
+    ap.add_argument("--dissolve", type=float, help="ディゾルブ秒数")
+    ap.add_argument("--asset-type", choices=["image", "video"], help="OP/ED素材の種類 (省略時は自動判定)")
+    ap.add_argument("--silence-cut", action="store_true", default=None, help="指定秒数以上の無音をカットする")
+    ap.add_argument("--silence-sec", type=float, help="無音カットの最小秒数 (既定3)")
+    ap.add_argument("--silence-db", type=int, help="無音判定のしきい値 dB (既定-38)")
+    args = ap.parse_args(argv)
+
+    cfg = _load_cfg(args)
+    _overlay(cfg, [("trim_start", args.trim_start), ("trim_tail", args.trim_tail),
+                   ("end", args.end), ("intro_sec", args.intro_sec),
+                   ("outro_sec", args.outro_sec), ("dissolve", args.dissolve),
+                   ("asset_type", args.asset_type), ("silence_sec", args.silence_sec),
+                   ("silence_db", args.silence_db)])
+    if args.silence_cut:
+        cfg["silence_cut"] = True
+
+    plan = compute_plan(Path(args.video), cfg,
+                        transcript_path=args.transcript,
+                        thumb=Path(args.thumb) if args.thumb else None)
+    text = json.dumps(plan, ensure_ascii=False, indent=2)
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        sp = plan.get("speakers") or {}
+        print(f"plan を書きました: {args.out}")
+        print(f"  開始点: {plan['trim_start']}s (出所: {plan['trim_start_source']}) / "
+              f"終了: {plan['end']}s / 想定尺: {plan['expected_duration']}s")
+        if sp:
+            print(f"  登壇者推定: {sp.get('main_speaker_guess')} "
+                  f"(名前: {sp.get('names')}) / 話者別秒数: {sp.get('speakers')}")
+        if plan["silence"]["cuts"]:
+            print(f"  無音カット: {len(plan['silence']['cuts'])}箇所")
+    else:
+        print(text)
+
+
+def _render_cli(argv):
+    ap = argparse.ArgumentParser(
+        prog="edit.py render", description="カット案 (plan JSON) から書き出す")
+    ap.add_argument("--plan", required=True, help="plan JSON のパス")
+    ap.add_argument("--thumb", help="OP/ED素材 (省略時は plan に記録された素材)")
+    ap.add_argument("-o", "--output", help="出力ファイル (省略時は 元動画名_edited.mp4)")
+    ap.add_argument("--config", help="設定ファイル (json)。表示・品質系のみ上書き可")
+    ap.add_argument("--dissolve", type=float, help="ディゾルブ秒数")
+    ap.add_argument("--intro-sec", type=float, help="頭サムネの表示秒数")
+    ap.add_argument("--outro-sec", type=float, help="お尻サムネの表示秒数")
+    ap.add_argument("--asset-type", choices=["image", "video"], help="OP/ED素材の種類")
+    ap.add_argument("--encoder", choices=["auto", "x264", "nvenc"], help="エンコーダ (既定auto)")
+    ap.add_argument("--crf", type=int, help="libx264 の crf")
+    ap.add_argument("--preset", help="libx264 の preset")
+    ap.add_argument("--two-pass", action="store_true", help="従来の2パス方式で書き出す")
+    args = ap.parse_args(argv)
+
+    plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+    cfg = _load_cfg(args)
+    _overlay(cfg, [("dissolve", args.dissolve), ("intro_sec", args.intro_sec),
+                   ("outro_sec", args.outro_sec), ("asset_type", args.asset_type),
+                   ("encoder", args.encoder), ("crf", args.crf),
+                   ("preset", args.preset)])
+    if args.two_pass:
+        cfg["one_pass"] = False
+    if args.output:
+        output = Path(args.output)
+    else:
+        v = Path(plan["video"]["path"])
+        output = v.with_name(v.stem + "_edited.mp4")
+    render_plan(plan, output, cfg=cfg,
+                thumb=Path(args.thumb) if args.thumb else None)
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "plan":
+        _plan_cli(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "render":
+        _render_cli(sys.argv[2:])
+        return
+
     ap = argparse.ArgumentParser(description="Zoom動画 自動編集 (OP/EDカット + サムネ挿入 + ディゾルブ)")
     ap.add_argument("input", nargs="?", help="入力動画 mp4")
     ap.add_argument("thumb", nargs="?", help="Canvaサムネイル画像 png/jpg")
@@ -345,20 +784,21 @@ def main():
     ap.add_argument("--asset-type", choices=["image", "video"], help="OP/ED素材の種類 (省略時は自動判定)")
     ap.add_argument("--silence-cut", action="store_true", help="指定秒数以上の無音をカットする")
     ap.add_argument("--silence-sec", type=float, help="無音カットの最小秒数 (既定3)")
+    ap.add_argument("--encoder", choices=["auto", "x264", "nvenc"], help="エンコーダ (既定auto)")
+    ap.add_argument("--two-pass", action="store_true", help="従来の2パス方式で書き出す")
     args = ap.parse_args()
 
-    cfg = {}
-    if args.config:
-        cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    cfg = _load_cfg(args)
     # CLI指定があれば config より優先
-    for key, val in [("trim_start", args.trim_start), ("trim_tail", args.trim_tail),
-                     ("end", args.end), ("intro_sec", args.intro_sec),
-                     ("outro_sec", args.outro_sec), ("dissolve", args.dissolve),
-                     ("asset_type", args.asset_type), ("silence_sec", args.silence_sec)]:
-        if val is not None:
-            cfg[key] = val
+    _overlay(cfg, [("trim_start", args.trim_start), ("trim_tail", args.trim_tail),
+                   ("end", args.end), ("intro_sec", args.intro_sec),
+                   ("outro_sec", args.outro_sec), ("dissolve", args.dissolve),
+                   ("asset_type", args.asset_type), ("silence_sec", args.silence_sec),
+                   ("encoder", args.encoder)])
     if args.silence_cut:
         cfg["silence_cut"] = True
+    if args.two_pass:
+        cfg["one_pass"] = False
 
     base = Path(__file__).parent
     if args.batch:
