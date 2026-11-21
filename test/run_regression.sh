@@ -138,4 +138,46 @@ PY
 $E render --plan planH.json -o outH.mp4 > /dev/null 2>&1
 check "$(dur outH.mp4)" 23.0 "H render (silence kept)"
 
+echo "== Case I: ユーザーカット (保持区間の一部を手動で切る) =="
+cat > cfgI.json <<'J'
+{"intro_sec": 2, "outro_sec": 2, "dissolve": 0.5, "user_cuts": [[5, 10]]}
+J
+$E plan --video plain.mp4 --thumb "$OLDPWD/$THUMB" --config cfgI.json \
+  --out planI.json > /dev/null
+python3 - <<'PY'
+import json
+p = json.load(open("planI.json"))
+c = p["silence"]["candidates"]
+assert len(c) == 1 and c[0]["source"] == "user" and c[0]["enabled"] is True, c
+assert p["silence"]["user_cuts"] == [[5.0, 10.0]], p["silence"]
+assert p["silence"]["keeps"] == [[0.0, 5.0], [10.0, 20.0]], p["silence"]
+# 保持15s - つなぎ0.5 + 2 + 2 - 0.5*2 = 17.5
+assert p["expected_duration"] == 17.5, p
+print("OK   I plan JSON (user_cuts / candidates source)")
+PY
+$E render --plan planI.json -o outI.mp4 > /dev/null 2>&1
+check "$(dur outI.mp4)" 17.5 "I render (user cut via plan)"
+$E plain.mp4 "$OLDPWD/$THUMB" -o outI2.mp4 --config cfgI.json > /dev/null 2>&1
+check "$(dur outI2.mp4)" 17.5 "I build_and_run (user cut via cfg)"
+
+echo "== Case J: ユーザーカット + 無音カット併用 =="
+cat > cfgJ.json <<'J'
+{"silence_cut": true, "silence_sec": 3.0, "intro_sec": 2, "outro_sec": 2,
+ "dissolve": 0.5, "user_cuts": [[12, 14]]}
+J
+$E plan --video sil.mp4 --thumb "$OLDPWD/$THUMB" --config cfgJ.json \
+  --out planJ.json > /dev/null
+python3 - <<'PY'
+import json
+p = json.load(open("planJ.json"))
+srcs = sorted(c["source"] for c in p["silence"]["candidates"])
+assert srcs == ["silence", "user"], srcs
+# 無音 [5,10] と手動 [12,14] が両方 keeps から引かれる
+assert p["silence"]["keeps"] == [[0.0, 5.0], [10.0, 12.0], [14.0, 20.0]], p["silence"]
+print("OK   J plan JSON (silence + user cuts)")
+PY
+$E render --plan planJ.json -o outJ.mp4 > /dev/null 2>&1
+# 保持13s - つなぎ0.5*2 + 2 + 2 - 0.5*2 = 15.0
+check "$(dur outJ.mp4)" 15.0 "J render (silence + user)"
+
 echo "REGRESSION OK"

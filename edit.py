@@ -386,15 +386,19 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None)
         raise ValueError(
             f"本編が0秒以下です (total={total:.1f}s, start={trim_start}, end={end})")
 
-    # --- 無音カット ---
+    # --- カット (無音カット + ユーザーカット) ---
     # 検出された無音はすべて candidates として plan に残し、
     # cfg["disabled_cuts"] ([[start, end], ...]) に入った区間は
     # 「切らない (残す)」として keeps 側に回す。人間がエディタで
     # 区間ごとに残す/切るを切り替えるための仕組み。
+    # cfg["user_cuts"] ([[start, end], ...]) は、人間が保持区間から
+    # 追加で切りたい区間。candidates には source: "user" で入り、
+    # keeps から差し引かれる (無音カットが OFF でも有効)。
     min_sec = float(cfg.get("silence_sec", 3.0))
     db = int(cfg.get("silence_db", -38))
     sil_enabled = bool(cfg.get("silence_cut", False)) and has_audio
     candidates = []
+    cuts = []
     if sil_enabled:
         _all_keeps, cuts_all = _keep_segments(
             detect_silences(input_video, min_sec, db), trim_start, end, min_sec)
@@ -409,25 +413,35 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None)
                     return True
             return False
 
-        cuts = []
         for c in cuts_all:
             enabled = not _is_disabled(c)
             candidates.append({"start": round(c[0], 3), "end": round(c[1], 3),
-                               "kind": "silence", "enabled": enabled})
+                               "kind": "silence", "source": "silence",
+                               "enabled": enabled})
             if enabled:
                 cuts.append(c)
-        keeps = []
-        cur = trim_start
-        for cs, ce in sorted(cuts):
-            if cs > cur:
-                keeps.append((cur, cs))
-            cur = max(cur, ce)
-        if cur < end:
-            keeps.append((cur, end))
-        if not keeps:
-            raise ValueError("無音カット後に残る区間がありません")
-    else:
-        keeps, cuts = [(trim_start, end)], []
+    # ユーザーカット: [trim_start, end] に収まるものだけ有効
+    user_cuts = []
+    for u in cfg.get("user_cuts") or []:
+        us, ue = max(float(u[0]), trim_start), min(float(u[1]), end)
+        if ue - us > 0.05:
+            user_cuts.append((us, ue))
+            candidates.append({"start": round(us, 3), "end": round(ue, 3),
+                               "kind": "user", "source": "user",
+                               "enabled": True})
+            cuts.append((us, ue))
+    candidates.sort(key=lambda c: c["start"])
+    cuts = sorted(cuts)
+    keeps = []
+    cur = trim_start
+    for cs, ce in cuts:
+        if cs > cur:
+            keeps.append((cur, cs))
+        cur = max(cur, ce)
+    if cur < end:
+        keeps.append((cur, end))
+    if not keeps:
+        raise ValueError("カット後に残る区間がありません")
 
     # --- 素材情報 ---
     asset = None
@@ -470,6 +484,7 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None)
             "min_sec": min_sec,
             "db": db,
             "cuts": [[round(s, 3), round(e, 3)] for s, e in cuts],
+            "user_cuts": [[round(s, 3), round(e, 3)] for s, e in user_cuts],
             "candidates": candidates,
             "keeps": [[round(s, 3), round(e, 3)] for s, e in keeps],
         },
@@ -732,7 +747,7 @@ def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict, progr
     cuts = plan["silence"]["cuts"]
     if cuts:
         removed = sum(e - s for s, e in cuts)
-        print(f"  無音カット: {len(cuts)}箇所 / 合計 {removed:.1f}秒を除去")
+        print(f"  カット: {len(cuts)}箇所 / 合計 {removed:.1f}秒を除去 (無音+手動)")
     render_plan(plan, Path(output), cfg=cfg, thumb=Path(thumb), progress_cb=progress_cb)
 
 

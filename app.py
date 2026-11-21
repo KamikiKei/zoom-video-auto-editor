@@ -51,20 +51,21 @@ HTML = r"""<!DOCTYPE html>
   button:disabled{opacity:.45;cursor:default}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:8px 0}
   #tlScroll{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:#fff;margin-top:6px}
-  #tlCanvas{position:relative;height:92px;min-width:100%;cursor:pointer}
+  #tlCanvas{position:relative;height:66px;min-width:100%;cursor:pointer}
   .tl-ruler{position:absolute;top:0;left:0;right:0;height:16px;border-bottom:1px solid #e3e6ea;overflow:hidden}
   .tl-tick{position:absolute;top:1px;height:14px;font-size:10px;color:#888;border-left:1px solid #ccc;padding-left:3px;white-space:nowrap}
-  .tl-lane{position:absolute;left:0;right:0;height:26px}
-  #tlLaneEdit{top:20px;background:#eef1f4}
-  #tlLaneSpk{top:52px;background:#f7f7f7}
-  .tl-blk{position:absolute;top:0;height:100%}
-  .tl-keep{background:#c9d6e2}
-  .tl-cut{background:repeating-linear-gradient(45deg,#d9534f 0 6px,#b52b27 6px 12px);cursor:pointer}
-  .tl-keepcand{background:#f2cf7e;cursor:pointer}
+  .tl-lane{position:absolute;left:0;right:0;top:20px;height:38px;background:#dfe3e8}
+  .tl-blk{position:absolute;top:0;height:100%;font-size:9px;color:#444;line-height:1.2;padding:2px 0 0 3px;overflow:hidden;white-space:nowrap}
+  .tl-seg{background:#c2cbd4}
+  .tl-seg.sp0{background:#5b8dd9;color:#fff}.tl-seg.sp1{background:var(--acc2);color:#fff}.tl-seg.sp2{background:#63b06a;color:#fff}.tl-seg.sp3{background:#b06ab0;color:#fff}
+  .tl-seg.sp-off{opacity:.38}
+  .tl-seg.is-cut{background-image:repeating-linear-gradient(45deg,rgba(0,0,0,.38) 0 6px,rgba(0,0,0,.10) 6px 12px);filter:brightness(.75)}
+  .tl-seg.is-cand{box-shadow:inset 0 0 0 2px #e6a817}
+  .tl-seg.is-user{box-shadow:inset 0 -3px 0 rgba(20,40,80,.55)}
+  .tl-seg.is-cand.is-user{box-shadow:inset 0 0 0 2px #e6a817,inset 0 -3px 0 rgba(20,40,80,.55)}
+  .tl-candblk{cursor:pointer}
   .tl-out{background:rgba(0,0,0,.28)}
-  .tl-spk{cursor:pointer}
-  .tl-spk.sp0{background:#5b8dd9}.tl-spk.sp1{background:var(--acc2)}.tl-spk.sp2{background:#63b06a}.tl-spk.sp3{background:#b06ab0}
-  .tl-lanehint{font-size:11px;color:#999;padding:5px 8px}
+  #tlSel{position:absolute;top:20px;height:38px;background:rgba(34,85,170,.28);border:1px solid var(--acc);z-index:4;pointer-events:none}
   #tlPlayhead{position:absolute;top:0;bottom:0;width:2px;background:#e02424;z-index:5;pointer-events:none}
   #tlStartMarker{position:absolute;top:0;bottom:0;width:12px;margin-left:-6px;z-index:6;cursor:ew-resize}
   #tlStartMarker::before{content:'';position:absolute;top:0;bottom:0;left:5px;width:2px;background:#1d7a35}
@@ -96,12 +97,13 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <div id="tlScroll"><div id="tlCanvas">
       <div class="tl-ruler" id="tlRuler"></div>
-      <div class="tl-lane" id="tlLaneEdit"></div>
-      <div class="tl-lane" id="tlLaneSpk"></div>
+      <div class="tl-lane" id="tlLane"></div>
+      <div id="tlSel" class="hidden"></div>
       <div id="tlPlayhead"></div>
       <div id="tlStartMarker"></div>
     </div></div>
-    <div class="msg" style="margin-top:6px">上段＝編集（水色：残す／赤：切る／黄：カット候補だけど残す）。赤・黄の区間をクリックすると 切る⇔残す が切り替わり、その位置を再生します。下段＝話者（クリックで再生）。緑＝開始点（ドラッグで移動）。タイムラインのクリックで移動、ボタン／スライダー／Ctrl+ホイールで拡大縮小。</div>
+    <div id="tlSelBar" class="row hidden"><span class="msg" id="tlSelText"></span><button class="sub" id="tlAddCutBtn">この区間をカット</button><button class="sub" id="tlSelCancelBtn">やめる</button></div>
+    <div class="msg" style="margin-top:6px">タイムライン（1本）：色＝話者（灰色＝話者なし）、斜線＋暗い区間＝カット、黄色枠＝カット候補だけど残す。カット区間・候補をクリックすると 切る⇔残す が切り替わり、その位置を再生します。残す区間を切りたいときは、タイムライン上をドラッグで範囲を選んで「この区間をカット」（手動カットは下線つき、クリックで解除）。緑＝開始点（ドラッグで移動）。クリックで移動、ボタン／スライダー／Ctrl+ホイールで拡大縮小。</div>
   </div>
   <div style="height:10px"></div>
   <div class="drop" id="thumbDrop">OP/ED素材（画像 or 動画）をドロップ / クリックで選択<input type="file" id="thumbFile" accept="image/*,video/*" class="hidden"></div>
@@ -141,7 +143,12 @@ HTML = r"""<!DOCTYPE html>
     <label><input type="number" id="silenceSec" value="3" step="0.5" min="1" style="width:60px"> 秒以上の無音を除去</label>
   </div>
   <div id="cutWrap" class="hidden">
-    <div class="msg">カット候補（無音区間）は上のタイムラインに表示されます。赤い区間が「切る」、黄色は「候補だけど残す」。区間をクリックすると 切る⇔残す が切り替わり、その位置を再生して確認できます（画面共有中の音声など、消したくない区間は黄色に戻してください）。</div>
+    <div class="msg">カット候補（無音区間）と手動カットは上のタイムラインに表示されます。斜線の区間が「切る」、黄色枠は「候補だけど残す」。区間をクリックすると 切る⇔残す が切り替わり、その位置を再生して確認できます（画面共有中の音声など、消したくない区間はクリックして残してください）。保持区間を切りたいときは、タイムラインをドラッグで範囲選択するか、下で時刻を指定して手動カットを追加できます。</div>
+    <div class="row">
+      <label>手動カット追加 <input type="text" id="cutAddStart" placeholder="開始 0:00" style="width:84px"></label> 〜
+      <label><input type="text" id="cutAddEnd" placeholder="終了 0:00" style="width:84px"></label>
+      <button class="sub" id="cutAddBtn">この区間をカットに追加</button>
+    </div>
     <div class="row"><button class="sub" id="refetchCutsBtn">カット候補を再検出</button><span class="msg" id="cutMsg"></span></div>
   </div>
 </div>
@@ -297,10 +304,11 @@ function renderDiar(presenters){
 let cutCandidates=[];
 function renderCuts(){
   $('cutWrap').classList.remove('hidden');
-  if(!cutCandidates.length){ $('cutMsg').textContent='カット候補はありません'; }
+  if(!cutCandidates.length){ $('cutMsg').textContent='カット候補はありません（タイムラインのドラッグで手動カットも追加できます）'; }
   else{
     const on=cutCandidates.filter(c=>c.enabled).length;
-    $('cutMsg').textContent=`カット候補 ${cutCandidates.length}件（うち ${on}件を切る）— タイムラインの区間クリックで切り替えてください`;
+    const usr=cutCandidates.filter(c=>c.source==='user').length;
+    $('cutMsg').textContent=`カット区間 ${cutCandidates.length}件（うち ${on}件を切る / 手動カット ${usr}件）— タイムラインの区間クリックで切り替えてください`;
   }
   renderTimeline();
 }
@@ -313,18 +321,27 @@ async function loadSilences(){
     while(true){
       await new Promise(r=>setTimeout(r,1500));
       const {st}=await pollStatus();
-      if(st.silence_stage==='done'){ cutCandidates=st.silences||[]; break; }
+      if(st.silence_stage==='done'){
+        // 再検出しても手動カットは消さない
+        const users=cutCandidates.filter(c=>c.source==='user');
+        cutCandidates=(st.silences||[]).map(c=>({...c, source:c.source||'silence'})).concat(users);
+        break;
+      }
       if(st.silence_stage==='error'){ throw new Error(st.error||'検出に失敗'); }
     }
     renderCuts();
   }catch(e){ $('cutMsg').textContent=e.message; }
 }
-// ===== タイムライン (上段=編集レーン / 下段=話者レーン) =====
-// データフローは従来どおり: 区間の取捨は cutCandidates[i].enabled を切り替え、
-// 「編集する」時に enabled=false の候補が disabled_cuts として渡る。
+// ===== タイムライン (1レーン統合: 色=話者 / 斜線+減光=カット) =====
+// [開始, 終了] の全区間を話者区間とカット候補の境界で欠けなく分割し、
+// 各区間に「話者は誰か (塗り色)」と「残す/切る (斜線・減光)」を同時に出す。
+// データフロー: 区間の取捨は cutCandidates[i].enabled を切り替える。
+// 「編集する」時、無効化した無音候補は disabled_cuts に、有効な手動カット
+// (source: "user") は user_cuts として process に渡る。
 let tlPx=0; // 0 = 全体表示 (fit)。>0 は px/秒
 const TL_MAXPX=120; // 最大拡大 (1秒=120px まで寄れる)
 let tlDragMovedAt=0;
+let tlPendingSel=null; // ドラッグ選択中の手動カット候補 {start, end}
 function tlFitPx(){ const w=$('tlScroll').clientWidth||800; return videoDur>0? w/videoDur : 1; }
 function tlPxPerSec(){ return tlPx>0? tlPx : tlFitPx(); }
 function tlAddBlock(parent,a,b,cls){
@@ -335,6 +352,7 @@ function tlAddBlock(parent,a,b,cls){
   parent.appendChild(d); return d;
 }
 function seekPlay(t){ const p=$('player'); p.currentTime=t; p.play(); }
+function normCand(c){ return {...c, source:c.source||(c.kind==='user'?'user':'silence')}; }
 function renderTimeline(){
   if(!videoDur) return;
   const has = !!diar || cutCandidates.length>0;
@@ -349,37 +367,112 @@ function renderTimeline(){
     const d=document.createElement('div'); d.className='tl-tick';
     d.style.left=(t*px)+'px'; d.textContent=fmt(t); ruler.appendChild(d);
   }
-  renderEditLane(); renderSpkLane();
+  renderLane();
+  if(tlPendingSel) tlShowSel(tlPendingSel.start, tlPendingSel.end);
   positionPlayhead(); positionStartMarker(); syncZoomSlider();
 }
-function renderEditLane(){
-  const lane=$('tlLaneEdit'); lane.innerHTML='';
+function speakerAt(t){
+  if(!diar) return null;
+  const sg=diar.segments.find(x=>t>=x.start&&t<x.end);
+  return sg? sg.speaker : null;
+}
+function renderLane(){
+  const lane=$('tlLane'); lane.innerHTML='';
   const sv=parseT($('startInput').value), ev=parseT($('endInput').value);
   const s=sv==null?0:sv, e=ev==null?videoDur:ev;
   tlAddBlock(lane,0,s,'tl-out'); tlAddBlock(lane,e,videoDur,'tl-out');
-  let cur=s;
-  const cuts=cutCandidates.filter(c=>c.enabled).slice().sort((a,b)=>a.start-b.start);
-  for(const c of cuts){ if(c.start>cur) tlAddBlock(lane,cur,Math.min(c.start,e),'tl-keep'); cur=Math.max(cur,c.end); if(cur>=e) break; }
-  if(cur<e) tlAddBlock(lane,cur,e,'tl-keep');
-  cutCandidates.forEach(c=>{
-    const d=tlAddBlock(lane,c.start,c.end, c.enabled?'tl-cut':'tl-keepcand');
-    if(!d) return;
-    d.title=`無音 ${fmt(c.start)}〜${fmt(c.end)}（${(c.end-c.start).toFixed(1)}秒）クリックで「${c.enabled?'残す':'切る'}」に切替`;
-    d.onclick=ev2=>{ ev2.stopPropagation(); c.enabled=!c.enabled; renderCuts(); seekPlay(c.start); };
-  });
-}
-function renderSpkLane(){
-  const lane=$('tlLaneSpk'); lane.innerHTML='';
-  if(!diar){ lane.innerHTML='<div class="tl-lanehint">話者を解析すると発話区間がここに表示されます</div>'; return; }
+  // [s, e] を話者区間とカット候補の境界で欠けなく分割する
+  const pts=new Set([s,e]);
+  const clip=t=>Math.max(s,Math.min(e,t));
+  if(diar) diar.segments.forEach(sg=>{ pts.add(clip(sg.start)); pts.add(clip(sg.end)); });
+  cutCandidates.forEach(c=>{ pts.add(clip(c.start)); pts.add(clip(c.end)); });
+  const arr=[...pts].sort((a,b)=>a-b);
   const sel=selectedPresenters();
-  diar.segments.forEach(sg=>{
-    const d=tlAddBlock(lane,sg.start,sg.end,'tl-spk sp'+sg.speaker);
-    if(!d) return;
-    if(sel.length && !sel.includes(sg.speaker)) d.style.opacity=.28;
-    d.title=`${(diar.names&&diar.names[sg.speaker])||('話者'+(sg.speaker+1))} ${fmt(sg.start)}〜${fmt(sg.end)}`;
-    d.onclick=ev=>{ ev.stopPropagation(); seekPlay(sg.start); };
-  });
+  for(let i=0;i+1<arr.length;i++){
+    const a=arr[i], b=arr[i+1];
+    if(b-a<0.02) continue;
+    const mid=(a+b)/2;
+    const sp=speakerAt(mid);
+    const cand=cutCandidates.find(c=>mid>=c.start&&mid<c.end);
+    let cls='tl-seg'+(sp==null?'':' sp'+sp);
+    if(sp!=null && sel.length && !sel.includes(sp)) cls+=' sp-off';
+    if(cand&&cand.enabled) cls+=' is-cut';
+    if(cand&&!cand.enabled) cls+=' is-cand';
+    if(cand&&cand.source==='user') cls+=' is-user';
+    if(cand) cls+=' tl-candblk';
+    const d=tlAddBlock(lane,a,b,cls);
+    if(!d) continue;
+    const nm=sp==null?'話者なし':((diar.names&&diar.names[sp])||('話者'+(Number(sp)+1)));
+    const state=!cand?'残す':(cand.enabled?'カット':'候補だけど残す');
+    const kindTxt=cand?(cand.source==='user'?'手動カット':'無音候補'):'';
+    d.title=`${nm} ${fmt(a)}〜${fmt(b)}（${state}${kindTxt?' / '+kindTxt:''}）`+(cand?' クリックで切替':'');
+    if((b-a)*tlPxPerSec()>52) d.textContent=nm;
+    if(cand){
+      d.onclick=ev2=>{
+        ev2.stopPropagation();
+        if(Date.now()-tlDragMovedAt<300) return;
+        cand.enabled=!cand.enabled; renderCuts(); seekPlay(cand.start);
+      };
+    }
+  }
 }
+// ===== 範囲ドラッグで手動カットを追加 =====
+let tlSelStart=null;
+function tlTimeFromEvent(e){
+  const r=$('tlCanvas').getBoundingClientRect();
+  return Math.max(0, Math.min(videoDur, (e.clientX-r.left)/tlPxPerSec()));
+}
+function tlShowSel(a,b){
+  const el=$('tlSel'); const px=tlPxPerSec();
+  el.classList.remove('hidden');
+  el.style.left=(Math.min(a,b)*px)+'px';
+  el.style.width=(Math.abs(b-a)*px)+'px';
+}
+function tlClearSel(){
+  tlPendingSel=null; tlSelStart=null;
+  $('tlSel').classList.add('hidden');
+  $('tlSelBar').classList.add('hidden');
+}
+$('tlCanvas').addEventListener('pointerdown', e=>{
+  if(e.target.closest&&e.target.closest('#tlStartMarker')) return;
+  if(e.target.closest&&e.target.closest('.tl-candblk')) return;
+  tlSelStart={t:tlTimeFromEvent(e), moved:false};
+});
+window.addEventListener('pointermove', e=>{
+  if(!tlSelStart) return;
+  const t=tlTimeFromEvent(e);
+  if(Math.abs(t-tlSelStart.t)*tlPxPerSec()>5) tlSelStart.moved=true;
+  if(tlSelStart.moved) tlShowSel(tlSelStart.t, t);
+});
+window.addEventListener('pointerup', e=>{
+  if(!tlSelStart) return;
+  const t=tlTimeFromEvent(e);
+  if(tlSelStart.moved && Math.abs(t-tlSelStart.t)>=0.3){
+    tlPendingSel={start:Math.min(tlSelStart.t,t), end:Math.max(tlSelStart.t,t)};
+    tlShowSel(tlPendingSel.start, tlPendingSel.end);
+    $('tlSelText').textContent=`選択中: ${fmt(tlPendingSel.start)} 〜 ${fmt(tlPendingSel.end)}（${(tlPendingSel.end-tlPendingSel.start).toFixed(1)}秒）`;
+    $('tlSelBar').classList.remove('hidden');
+    tlDragMovedAt=Date.now(); // 直後のクリックでシークしない
+  }else{
+    $('tlSel').classList.add('hidden');
+  }
+  tlSelStart=null;
+});
+function addUserCut(a,b){
+  if(b-a<0.3) return false;
+  cutCandidates.push({start:Math.round(a*1000)/1000, end:Math.round(b*1000)/1000,
+                      kind:'user', source:'user', enabled:true});
+  cutCandidates.sort((x,y)=>x.start-y.start);
+  renderCuts();
+  return true;
+}
+$('tlAddCutBtn').onclick=()=>{ if(tlPendingSel) addUserCut(tlPendingSel.start, tlPendingSel.end); tlClearSel(); };
+$('tlSelCancelBtn').onclick=()=>tlClearSel();
+$('cutAddBtn').onclick=()=>{
+  const a=parseT($('cutAddStart').value), b=parseT($('cutAddEnd').value);
+  if(a==null||b==null||b<=a){ $('cutMsg').textContent='手動カットの開始・終了を確認してください'; return; }
+  if(addUserCut(a,b)){ $('cutAddStart').value=''; $('cutAddEnd').value=''; }
+};
 function positionPlayhead(){
   const p=$('player'); if(!p) return;
   $('tlPlayhead').style.left=((p.currentTime||0)*tlPxPerSec())+'px';
@@ -459,7 +552,8 @@ $('runBtn').onclick=async()=>{
       asset_type:document.querySelector('input[name=assetType]:checked').value,
       silence_cut:$('silenceCut').checked, silence_sec:parseFloat($('silenceSec').value)||3,
       presenters:selectedPresenters(),
-      disabled_cuts:cutCandidates.filter(c=>!c.enabled).map(c=>[c.start,c.end])})});
+      disabled_cuts:cutCandidates.filter(c=>!c.enabled&&c.source!=='user').map(c=>[c.start,c.end]),
+      user_cuts:cutCandidates.filter(c=>c.enabled&&c.source==='user').map(c=>[c.start,c.end])})});
     const bar=$('procProg'); bar.classList.remove('hidden'); bar.value=0;
     $('runMsg').textContent='編集中… 0%（この間、黒い画面は閉じないでください）';
     while(true){
@@ -510,7 +604,7 @@ $('runBtn').onclick=async()=>{
       if(sil.min_sec!=null) $('silenceSec').value=sil.min_sec;
       updateDur();
       $('analyzeMsg').innerHTML='<span class="ok">カット案を読み込みました</span> 開始点・無音カットは自動判定済みです。違うと思ったら直してください。';
-      if(sil.candidates){ cutCandidates=sil.candidates; renderCuts(); }
+      if(sil.candidates){ cutCandidates=sil.candidates.map(normCand); renderCuts(); }
       renderTimeline();
     }
     $('analyzeBtn').disabled=false;
@@ -763,7 +857,7 @@ class Handler(BaseHTTPRequestHandler):
                 db = int(params.get("silence_db", -38))
                 found = detect_silences(d / "input.mp4", min_sec, db)
                 cands = [{"start": round(s, 3), "end": round(e, 3),
-                          "kind": "silence", "enabled": True}
+                          "kind": "silence", "source": "silence", "enabled": True}
                          for s, e in found if e - s >= min_sec - 0.05]
                 with LOCK:
                     JOBS[job_id]["silences"] = cands
@@ -814,6 +908,9 @@ class Handler(BaseHTTPRequestHandler):
         if params.get("disabled_cuts") is not None:
             cfg["disabled_cuts"] = [[float(a), float(b)]
                                     for a, b in params["disabled_cuts"]]
+        if params.get("user_cuts") is not None:
+            cfg["user_cuts"] = [[float(a), float(b)]
+                                for a, b in params["user_cuts"]]
         def cb(pct):
             with LOCK:
                 JOBS[job_id]["progress"] = pct
