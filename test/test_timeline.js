@@ -2,8 +2,9 @@
 // ブラウザの無い環境向けに最小DOMシムを用意し、app.py から <script> を
 // 抜き出して実コードを実行する。検証対象:
 //   - 統合タイムラインの分割描画 (話者色 × カット状態が同時に出る)
-//   - 候補ブロックのクリックで 切る⇔残す が切り替わる
-//   - addUserCut で手動カットが追加され、タイムラインに反映される
+//   - 候補ブロックのタップで 切る⇔残す が切り替わる
+//   - 保持ブロックのタップでその範囲がカット対象になり、再タップで戻る
+//     (ドラッグ範囲選択によるカット追加UIは廃止されている)
 //   - 「編集する」の送信内容に disabled_cuts / user_cuts が正しく入る
 // 実行: node test/test_timeline.js
 const fs = require('fs');
@@ -93,17 +94,27 @@ const tests = `
   assert(byRange(20, 30)._cls.has('is-cand') && !byRange(20, 30)._cls.has('is-cut'), 'redrawn as kept candidate');
   console.log('OK   candidate click toggles cut -> keep');
 
-  // --- 手動カット追加 (ドラッグ選択と時刻指定の共通パス) ---
-  assert.strictEqual(addUserCut(60, 70), true);
-  assert.strictEqual(cutCandidates.length, 3);
-  const b6070 = byRange(60, 70);
-  assert(b6070 && b6070._cls.has('is-cut') && b6070._cls.has('is-user'), '[60,70] user cut drawn');
-  // 手動カットもクリックで解除 (残す) できる
-  b6070.onclick({ stopPropagation(){} });
-  assert.strictEqual(cutCandidates.find(c => c.source === 'user').enabled, false, 'user cut toggled off');
-  b6070.onclick({ stopPropagation(){} });
-  assert.strictEqual(cutCandidates.find(c => c.source === 'user').enabled, true, 'user cut toggled back on');
-  console.log('OK   user cut add / toggle on the timeline');
+  // --- ドラッグ範囲選択によるカット追加は廃止されている ---
+  assert.strictEqual(typeof addUserCut, 'undefined', 'addUserCut must not exist');
+  for (const gone of ['tlSel', 'tlSelBar', 'tlAddCutBtn', 'cutAddBtn', 'cutAddStart', 'cutAddEnd']) {
+    assert(!appPy.includes(gone), 'app.py must not contain ' + gone);
+  }
+  console.log('OK   drag-to-add UI removed');
+
+  // --- 保持ブロックのタップで、その範囲がカット対象になる ---
+  b4045.onclick({ stopPropagation(){} });
+  assert.strictEqual(cutCandidates.length, 3, 'user cut created by tap');
+  const uc = cutCandidates.find(c => c.source === 'user');
+  assert(uc && uc.start === 40 && uc.end === 50 && uc.enabled === true, 'user cut = tapped block [40,50]');
+  const b4050cut = byRange(40, 50);
+  assert(b4050cut && b4050cut._cls.has('is-cut') && b4050cut._cls.has('is-user'), '[40,50] drawn as user cut');
+  assert.strictEqual(document.getElementById('player').currentTime, 40, 'seek to tapped block start');
+  // 再タップで解除 (残す) 、もう一度で再びカット
+  b4050cut.onclick({ stopPropagation(){} });
+  assert.strictEqual(uc.enabled, false, 'user cut toggled off by second tap');
+  byRange(40, 50).onclick({ stopPropagation(){} });
+  assert.strictEqual(uc.enabled, true, 'user cut toggled back on');
+  console.log('OK   tap plain block to cut / tap again to keep');
 
   // --- 「編集する」の送信内容: disabled_cuts と user_cuts が分かれて入る ---
   jobId = 'testjob'; uploaded = true;
@@ -112,7 +123,7 @@ const tests = `
   assert(call, 'process API called');
   const body = JSON.parse(call.opts.body);
   assert.deepStrictEqual(body.disabled_cuts, [[20, 30], [50, 55]], 'disabled_cuts: ' + JSON.stringify(body.disabled_cuts));
-  assert.deepStrictEqual(body.user_cuts, [[60, 70]], 'user_cuts: ' + JSON.stringify(body.user_cuts));
+  assert.deepStrictEqual(body.user_cuts, [[40, 50]], 'user_cuts: ' + JSON.stringify(body.user_cuts));
   console.log('OK   process payload (disabled_cuts / user_cuts)');
 
   console.log('TIMELINE JS TEST OK');

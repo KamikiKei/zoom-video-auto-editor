@@ -63,9 +63,8 @@ HTML = r"""<!DOCTYPE html>
   .tl-seg.is-cand{box-shadow:inset 0 0 0 2px #e6a817}
   .tl-seg.is-user{box-shadow:inset 0 -3px 0 rgba(20,40,80,.55)}
   .tl-seg.is-cand.is-user{box-shadow:inset 0 0 0 2px #e6a817,inset 0 -3px 0 rgba(20,40,80,.55)}
-  .tl-candblk{cursor:pointer}
+  .tl-seg{cursor:pointer}
   .tl-out{background:rgba(0,0,0,.28)}
-  #tlSel{position:absolute;top:20px;height:38px;background:rgba(34,85,170,.28);border:1px solid var(--acc);z-index:4;pointer-events:none}
   #tlPlayhead{position:absolute;top:0;bottom:0;width:2px;background:#e02424;z-index:5;pointer-events:none}
   #tlStartMarker{position:absolute;top:0;bottom:0;width:12px;margin-left:-6px;z-index:6;cursor:ew-resize}
   #tlStartMarker::before{content:'';position:absolute;top:0;bottom:0;left:5px;width:2px;background:#1d7a35}
@@ -98,12 +97,10 @@ HTML = r"""<!DOCTYPE html>
     <div id="tlScroll"><div id="tlCanvas">
       <div class="tl-ruler" id="tlRuler"></div>
       <div class="tl-lane" id="tlLane"></div>
-      <div id="tlSel" class="hidden"></div>
       <div id="tlPlayhead"></div>
       <div id="tlStartMarker"></div>
     </div></div>
-    <div id="tlSelBar" class="row hidden"><span class="msg" id="tlSelText"></span><button class="sub" id="tlAddCutBtn">この区間をカット</button><button class="sub" id="tlSelCancelBtn">やめる</button></div>
-    <div class="msg" style="margin-top:6px">タイムライン（1本）：色＝話者（灰色＝話者なし）、斜線＋暗い区間＝カット、黄色枠＝カット候補だけど残す。カット区間・候補をクリックすると 切る⇔残す が切り替わり、その位置を再生します。残す区間を切りたいときは、タイムライン上をドラッグで範囲を選んで「この区間をカット」（手動カットは下線つき、クリックで解除）。緑＝開始点（ドラッグで移動）。クリックで移動、ボタン／スライダー／Ctrl+ホイールで拡大縮小。</div>
+    <div class="msg" style="margin-top:6px">タイムライン（1本）：色＝話者（灰色＝話者なし）、斜線＋暗い区間＝カット、黄色枠＝カット候補だけど残す。区間をタップ（クリック）すると 消す⇔残す が切り替わり、その位置を再生します。残す区間もタップでカットにできます（もう一度タップで戻ります）。緑＝開始点（ドラッグで移動）。ボタン／スライダー／Ctrl+ホイールで拡大縮小。</div>
   </div>
   <div style="height:10px"></div>
   <div class="drop" id="thumbDrop">OP/ED素材（画像 or 動画）をドロップ / クリックで選択<input type="file" id="thumbFile" accept="image/*,video/*" class="hidden"></div>
@@ -143,12 +140,7 @@ HTML = r"""<!DOCTYPE html>
     <label><input type="number" id="silenceSec" value="3" step="0.5" min="1" style="width:60px"> 秒以上の無音を除去</label>
   </div>
   <div id="cutWrap" class="hidden">
-    <div class="msg">カット候補（無音区間）と手動カットは上のタイムラインに表示されます。斜線の区間が「切る」、黄色枠は「候補だけど残す」。区間をクリックすると 切る⇔残す が切り替わり、その位置を再生して確認できます（画面共有中の音声など、消したくない区間はクリックして残してください）。保持区間を切りたいときは、タイムラインをドラッグで範囲選択するか、下で時刻を指定して手動カットを追加できます。</div>
-    <div class="row">
-      <label>手動カット追加 <input type="text" id="cutAddStart" placeholder="開始 0:00" style="width:84px"></label> 〜
-      <label><input type="text" id="cutAddEnd" placeholder="終了 0:00" style="width:84px"></label>
-      <button class="sub" id="cutAddBtn">この区間をカットに追加</button>
-    </div>
+    <div class="msg">カット候補（無音区間）は上のタイムラインに表示されます。斜線の区間が「切る」、黄色枠は「候補だけど残す」。区間をタップ（クリック）すると 消す⇔残す が切り替わり、その位置を再生して確認できます（画面共有中の音声など、消したくない区間はタップして残してください）。残す区間もタップすればカットにできます。</div>
     <div class="row"><button class="sub" id="refetchCutsBtn">カット候補を再検出</button><span class="msg" id="cutMsg"></span></div>
   </div>
 </div>
@@ -304,11 +296,11 @@ function renderDiar(presenters){
 let cutCandidates=[];
 function renderCuts(){
   $('cutWrap').classList.remove('hidden');
-  if(!cutCandidates.length){ $('cutMsg').textContent='カット候補はありません（タイムラインのドラッグで手動カットも追加できます）'; }
+  if(!cutCandidates.length){ $('cutMsg').textContent='カット候補はありません（タイムラインの区間をタップするとカットにできます）'; }
   else{
     const on=cutCandidates.filter(c=>c.enabled).length;
     const usr=cutCandidates.filter(c=>c.source==='user').length;
-    $('cutMsg').textContent=`カット区間 ${cutCandidates.length}件（うち ${on}件を切る / 手動カット ${usr}件）— タイムラインの区間クリックで切り替えてください`;
+    $('cutMsg').textContent=`カット区間 ${cutCandidates.length}件（うち ${on}件を切る / タップで付けたカット ${usr}件）— タイムラインの区間タップで切り替えてください`;
   }
   renderTimeline();
 }
@@ -335,13 +327,14 @@ async function loadSilences(){
 // ===== タイムライン (1レーン統合: 色=話者 / 斜線+減光=カット) =====
 // [開始, 終了] の全区間を話者区間とカット候補の境界で欠けなく分割し、
 // 各区間に「話者は誰か (塗り色)」と「残す/切る (斜線・減光)」を同時に出す。
-// データフロー: 区間の取捨は cutCandidates[i].enabled を切り替える。
+// 操作はタップ (クリック) 切替のみ: ブロックをタップすると 消す⇔残す が
+// 切り替わる。候補の無い保持ブロックをタップすると、そのブロック範囲が
+// 手動カット (source: "user") として追加され、再タップで解除される。
 // 「編集する」時、無効化した無音候補は disabled_cuts に、有効な手動カット
-// (source: "user") は user_cuts として process に渡る。
+// は user_cuts として process に渡る。
 let tlPx=0; // 0 = 全体表示 (fit)。>0 は px/秒
 const TL_MAXPX=120; // 最大拡大 (1秒=120px まで寄れる)
 let tlDragMovedAt=0;
-let tlPendingSel=null; // ドラッグ選択中の手動カット候補 {start, end}
 function tlFitPx(){ const w=$('tlScroll').clientWidth||800; return videoDur>0? w/videoDur : 1; }
 function tlPxPerSec(){ return tlPx>0? tlPx : tlFitPx(); }
 function tlAddBlock(parent,a,b,cls){
@@ -368,7 +361,6 @@ function renderTimeline(){
     d.style.left=(t*px)+'px'; d.textContent=fmt(t); ruler.appendChild(d);
   }
   renderLane();
-  if(tlPendingSel) tlShowSel(tlPendingSel.start, tlPendingSel.end);
   positionPlayhead(); positionStartMarker(); syncZoomSlider();
 }
 function speakerAt(t){
@@ -404,75 +396,24 @@ function renderLane(){
     if(!d) continue;
     const nm=sp==null?'話者なし':((diar.names&&diar.names[sp])||('話者'+(Number(sp)+1)));
     const state=!cand?'残す':(cand.enabled?'カット':'候補だけど残す');
-    const kindTxt=cand?(cand.source==='user'?'手動カット':'無音候補'):'';
-    d.title=`${nm} ${fmt(a)}〜${fmt(b)}（${state}${kindTxt?' / '+kindTxt:''}）`+(cand?' クリックで切替':'');
+    const kindTxt=cand?(cand.source==='user'?'タップで追加したカット':'無音候補'):'';
+    d.title=`${nm} ${fmt(a)}〜${fmt(b)}（${state}${kindTxt?' / '+kindTxt:''}） タップで切替`;
     if((b-a)*tlPxPerSec()>52) d.textContent=nm;
-    if(cand){
-      d.onclick=ev2=>{
-        ev2.stopPropagation();
-        if(Date.now()-tlDragMovedAt<300) return;
+    d.onclick=ev2=>{
+      ev2.stopPropagation();
+      if(Date.now()-tlDragMovedAt<300) return;
+      if(cand){
         cand.enabled=!cand.enabled; renderCuts(); seekPlay(cand.start);
-      };
-    }
+      }else{
+        // 候補の無い保持ブロック: タップでその範囲をカット対象にする
+        cutCandidates.push({start:Math.round(a*1000)/1000, end:Math.round(b*1000)/1000,
+                            kind:'user', source:'user', enabled:true});
+        cutCandidates.sort((x,y)=>x.start-y.start);
+        renderCuts(); seekPlay(a);
+      }
+    };
   }
 }
-// ===== 範囲ドラッグで手動カットを追加 =====
-let tlSelStart=null;
-function tlTimeFromEvent(e){
-  const r=$('tlCanvas').getBoundingClientRect();
-  return Math.max(0, Math.min(videoDur, (e.clientX-r.left)/tlPxPerSec()));
-}
-function tlShowSel(a,b){
-  const el=$('tlSel'); const px=tlPxPerSec();
-  el.classList.remove('hidden');
-  el.style.left=(Math.min(a,b)*px)+'px';
-  el.style.width=(Math.abs(b-a)*px)+'px';
-}
-function tlClearSel(){
-  tlPendingSel=null; tlSelStart=null;
-  $('tlSel').classList.add('hidden');
-  $('tlSelBar').classList.add('hidden');
-}
-$('tlCanvas').addEventListener('pointerdown', e=>{
-  if(e.target.closest&&e.target.closest('#tlStartMarker')) return;
-  if(e.target.closest&&e.target.closest('.tl-candblk')) return;
-  tlSelStart={t:tlTimeFromEvent(e), moved:false};
-});
-window.addEventListener('pointermove', e=>{
-  if(!tlSelStart) return;
-  const t=tlTimeFromEvent(e);
-  if(Math.abs(t-tlSelStart.t)*tlPxPerSec()>5) tlSelStart.moved=true;
-  if(tlSelStart.moved) tlShowSel(tlSelStart.t, t);
-});
-window.addEventListener('pointerup', e=>{
-  if(!tlSelStart) return;
-  const t=tlTimeFromEvent(e);
-  if(tlSelStart.moved && Math.abs(t-tlSelStart.t)>=0.3){
-    tlPendingSel={start:Math.min(tlSelStart.t,t), end:Math.max(tlSelStart.t,t)};
-    tlShowSel(tlPendingSel.start, tlPendingSel.end);
-    $('tlSelText').textContent=`選択中: ${fmt(tlPendingSel.start)} 〜 ${fmt(tlPendingSel.end)}（${(tlPendingSel.end-tlPendingSel.start).toFixed(1)}秒）`;
-    $('tlSelBar').classList.remove('hidden');
-    tlDragMovedAt=Date.now(); // 直後のクリックでシークしない
-  }else{
-    $('tlSel').classList.add('hidden');
-  }
-  tlSelStart=null;
-});
-function addUserCut(a,b){
-  if(b-a<0.3) return false;
-  cutCandidates.push({start:Math.round(a*1000)/1000, end:Math.round(b*1000)/1000,
-                      kind:'user', source:'user', enabled:true});
-  cutCandidates.sort((x,y)=>x.start-y.start);
-  renderCuts();
-  return true;
-}
-$('tlAddCutBtn').onclick=()=>{ if(tlPendingSel) addUserCut(tlPendingSel.start, tlPendingSel.end); tlClearSel(); };
-$('tlSelCancelBtn').onclick=()=>tlClearSel();
-$('cutAddBtn').onclick=()=>{
-  const a=parseT($('cutAddStart').value), b=parseT($('cutAddEnd').value);
-  if(a==null||b==null||b<=a){ $('cutMsg').textContent='手動カットの開始・終了を確認してください'; return; }
-  if(addUserCut(a,b)){ $('cutAddStart').value=''; $('cutAddEnd').value=''; }
-};
 function positionPlayhead(){
   const p=$('player'); if(!p) return;
   $('tlPlayhead').style.left=((p.currentTime||0)*tlPxPerSec())+'px';
