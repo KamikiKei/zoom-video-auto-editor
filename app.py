@@ -106,6 +106,11 @@ HTML = r"""<!DOCTYPE html>
     <label><input type="checkbox" id="silenceCut" checked> 無音をカットする</label>
     <label><input type="number" id="silenceSec" value="3" step="0.5" min="1" style="width:60px"> 秒以上の無音を除去</label>
   </div>
+  <div id="cutWrap" class="hidden">
+    <div class="msg">カット候補（無音区間）。チェックが入った区間を切ります。外した区間は残します。時刻をクリックするとその位置を再生します。</div>
+    <div id="cutList"></div>
+    <div class="row"><button class="sub" id="refetchCutsBtn">カット候補を再検出</button><span class="msg" id="cutMsg"></span></div>
+  </div>
 </div>
 
 <div class="card"><h2><span class="step">4.</span> 編集してダウンロード</h2>
@@ -221,10 +226,23 @@ $('analyzeBtn').onclick=async()=>{
       ? '<span class="ok">解析できました</span> Zoom文字起こし（話者名つき）で分けました。登壇者を確認してください。'
       : '<span class="ok">解析できました</span> 話者ごとの声を聞いて、登壇者を選んでください。';
     renderDiar();
+    loadSilences();
   }catch(e){ $('analyzeMsg').innerHTML='<span class="err">'+e.message+'</span>'; }
   btn.disabled=false;
 };
-function renderDiar(){
+function selectedPresenters(){
+  return [...document.querySelectorAll('input[name=presenters]:checked')].map(el=>Number(el.value));
+}
+function updateStartFromPresenters(){
+  const ps=selectedPresenters();
+  if(!diar||!ps.length) return;
+  const segs=diar.segments.filter(sg=>ps.includes(sg.speaker));
+  if(!segs.length) return;
+  const seg=segs.find(sg=>(sg.end-sg.start)>=5)||segs[0];
+  $('startInput').value=fmt(seg.start); updateDur();
+  $('analyzeMsg').innerHTML=`<span class="ok">開始を ${fmt(seg.start)} にセットしました</span>（選んだ登壇者の最初の長い発言の頭）。プレビューで確認して、違うと思ったら手で直してください。`;
+}
+function renderDiar(presenters){
   const tl=$('timeline'); tl.innerHTML=''; tl.classList.remove('hidden');
   diar.segments.forEach(sg=>{
     const d=document.createElement('div'); d.className='seg sp'+sg.speaker;
@@ -235,6 +253,8 @@ function renderDiar(){
   });
   tl.onclick=e=>{ const r=tl.getBoundingClientRect(); $('player').currentTime=(e.clientX-r.left)/r.width*videoDur; };
   const wrap=$('speakerCards'); wrap.innerHTML='';
+  const defaults = presenters!=null ? presenters.map(Number)
+    : [diar.presenter_guess!=null ? diar.presenter_guess : diar.main_speaker_guess];
   Object.keys(diar.speakers).forEach(sp=>{
     const nm=(diar.names&&diar.names[sp])||`話者${Number(sp)+1}`;
     const isPresenter = diar.presenter_guess!=null && String(diar.presenter_guess)===String(sp);
@@ -243,31 +263,58 @@ function renderDiar(){
     const card=document.createElement('div'); card.className='spcard';
     card.innerHTML=`<span class="dot d${sp}"></span><b>${nm}</b> (発話 合計 ${fmt(diar.speakers[sp])}) `
       +`<audio controls src="/api/sample/${jobId}/${sp}" style="vertical-align:middle;height:32px"></audio> `
-      +`<label><input type="radio" name="mainsp" value="${sp}"> この人が登壇者</label>` + note;
+      +`<label><input type="checkbox" name="presenters" value="${sp}"${defaults.includes(Number(sp))?' checked':''}> 登壇者として扱う（複数可）</label>` + note;
     wrap.appendChild(card);
   });
-  wrap.querySelectorAll('input[name=mainsp]').forEach(r=>{
-    r.onchange=()=>{
-      const sp=Number(r.value);
-      const seg=diar.segments.find(sg=>sg.speaker===sp && (sg.end-sg.start)>=5) || diar.segments.find(sg=>sg.speaker===sp);
-      if(seg){ $('startInput').value=fmt(seg.start); updateDur(); $('analyzeMsg').innerHTML=`<span class="ok">開始を ${fmt(seg.start)} にセットしました</span> (登壇者の最初の長い発言の頭)。プレビューで確認して、違うと思ったら手で直してください。`; }
-    };
-  });
-  const target = diar.presenter_guess!=null ? diar.presenter_guess : diar.main_speaker_guess;
-  const guess=wrap.querySelector(`input[name=mainsp][value="${target}"]`);
-  if(guess){ guess.checked=true; guess.dispatchEvent(new Event('change')); }
+  wrap.querySelectorAll('input[name=presenters]').forEach(cb=>{ cb.onchange=updateStartFromPresenters; });
+  updateStartFromPresenters();
 }
+let cutCandidates=[];
+function renderCuts(){
+  const wrap=$('cutList'); wrap.innerHTML='';
+  $('cutWrap').classList.remove('hidden');
+  if(!cutCandidates.length){ $('cutMsg').textContent='カット候補はありません'; return; }
+  $('cutMsg').textContent='';
+  cutCandidates.forEach((c,i)=>{
+    const row=document.createElement('div'); row.className='row';
+    row.innerHTML=`<label><input type="checkbox" class="cutchk" data-i="${i}"${c.enabled?' checked':''}> 切る</label>`
+      +`<span class="msg" style="cursor:pointer;text-decoration:underline">${fmt(c.start)} 〜 ${fmt(c.end)}（無音 ${(c.end-c.start).toFixed(1)}秒）</span>`;
+    row.querySelector('span').onclick=()=>{ $('player').currentTime=c.start; $('player').play(); };
+    wrap.appendChild(row);
+  });
+  wrap.querySelectorAll('.cutchk').forEach(chk=>{
+    chk.onchange=()=>{ cutCandidates[Number(chk.dataset.i)].enabled=chk.checked; };
+  });
+}
+async function loadSilences(){
+  if(!jobId) return;
+  $('cutWrap').classList.remove('hidden');
+  $('cutMsg').textContent='カット候補を検出中…';
+  try{
+    await fetch(`/api/silences/${jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({silence_sec:parseFloat($('silenceSec').value)||3})});
+    while(true){
+      await new Promise(r=>setTimeout(r,1500));
+      const {st}=await pollStatus();
+      if(st.silence_stage==='done'){ cutCandidates=st.silences||[]; break; }
+      if(st.silence_stage==='error'){ throw new Error(st.error||'検出に失敗'); }
+    }
+    renderCuts();
+  }catch(e){ $('cutMsg').textContent=e.message; }
+}
+$('refetchCutsBtn').onclick=()=>loadSilences();
 $('runBtn').onclick=async()=>{
   const btn=$('runBtn'); btn.disabled=true; $('runMsg').textContent='準備中…';
   try{
     await ensureUploaded();
-    await xhrUpload(`/api/upload/${jobId}/thumb`, thumbFile, $('upProg'));
+    if(thumbFile) await xhrUpload(`/api/upload/${jobId}/thumb`, thumbFile, $('upProg'));
     const s=parseT($('startInput').value), e=parseT($('endInput').value);
     if(s==null||e==null||e<=s) throw new Error('開始・終了タイムを確認してください');
     await fetch(`/api/process/${jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
       trim_start:s, end:e, intro_sec:parseFloat($('introSec').value), outro_sec:parseFloat($('outroSec').value), dissolve:parseFloat($('dissolve').value),
       asset_type:document.querySelector('input[name=assetType]:checked').value,
-      silence_cut:$('silenceCut').checked, silence_sec:parseFloat($('silenceSec').value)||3})});
+      silence_cut:$('silenceCut').checked, silence_sec:parseFloat($('silenceSec').value)||3,
+      presenters:selectedPresenters(),
+      disabled_cuts:cutCandidates.filter(c=>!c.enabled).map(c=>[c.start,c.end])})});
     const bar=$('procProg'); bar.classList.remove('hidden'); bar.value=0;
     $('runMsg').textContent='編集中… 0%（この間、黒い画面は閉じないでください）';
     while(true){
@@ -283,6 +330,52 @@ $('runBtn').onclick=async()=>{
   }catch(e){ $('runMsg').innerHTML='<span class="err">'+e.message+'</span>'; }
   btn.disabled=false;
 };
+
+// パイプライン連携: ?job=<id> で開かれたら、サーバーに取り込み済みの
+// ジョブ (動画・文字起こし・カット案) を読み込んで微修正できる状態にする
+(async function initFromQuery(){
+  const jid=new URLSearchParams(location.search).get('job');
+  if(!jid) return;
+  try{
+    const info=await (await fetch(`/api/jobinfo/${jid}`)).json();
+    if(info.error||!info.has_video) return;
+    jobId=jid; uploaded=true;
+    const title=(info.meta&&info.meta.title)||'';
+    $('videoName').textContent='パイプラインから取り込み済みの動画です'+(title?`（${title}）`:'')+'。内容を確認して、必要なら微修正して「編集する」を押してください。';
+    const p=$('player'); p.src=`/api/video/${jid}`; p.classList.remove('hidden');
+    p.onloadedmetadata=()=>{ videoDur=p.duration; if(info.plan) videoDur=info.plan.video.duration||p.duration; updateDur(); };
+    if(info.has_thumb){
+      const at=(info.plan&&info.plan.asset&&info.plan.asset.type)||'image';
+      document.querySelector(`input[name=assetType][value="${at}"]`).checked=true;
+      syncAssetType();
+      if(at==='video'){ const vm=$('thumbVideoPreview'); vm.src=`/api/thumb/${jid}`; vm.classList.remove('hidden'); }
+      else { const im=$('thumbPreview'); im.src=`/api/thumb/${jid}`; im.classList.remove('hidden'); }
+    }
+    if(info.diarization){ diar=info.diarization; videoDur=(info.plan&&info.plan.video.duration)||0; renderDiar(info.plan && info.plan.presenters); }
+    if(info.plan){
+      videoDur=info.plan.video.duration||videoDur;
+      $('startInput').value=fmt(info.plan.trim_start);
+      $('endInput').value=fmt(info.plan.end);
+      const r=info.plan.render||{};
+      if(r.intro_sec!=null) $('introSec').value=r.intro_sec;
+      if(r.outro_sec!=null) $('outroSec').value=r.outro_sec;
+      if(r.dissolve!=null) $('dissolve').value=r.dissolve;
+      const sil=info.plan.silence||{};
+      $('silenceCut').checked=!!sil.enabled;
+      if(sil.min_sec!=null) $('silenceSec').value=sil.min_sec;
+      updateDur();
+      $('analyzeMsg').innerHTML='<span class="ok">カット案を読み込みました</span> 開始点・無音カットは自動判定済みです。違うと思ったら直してください。';
+      if(sil.candidates){ cutCandidates=sil.candidates; renderCuts(); }
+    }
+    $('analyzeBtn').disabled=false;
+    $('runBtn').disabled=false;
+    if(info.has_output){
+      $('runMsg').innerHTML='<span class="ok">書き出し済みです</span>（直す場合はもう一度「編集する」を押してください）';
+      const rp=$('resultPlayer'); rp.src=`/api/download/${jid}`; rp.classList.remove('hidden');
+      const dl=$('dlLink'); dl.href=`/api/download/${jid}`; dl.classList.remove('hidden');
+    }
+  }catch(e){ /* 通常フローにフォールバック */ }
+})();
 </script></body></html>"""
 
 
@@ -290,6 +383,28 @@ def job_dir(job_id: str) -> Path:
     d = JOBS_DIR / job_id
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def disk_job(job_id: str):
+    """メモリ上に無いジョブ (パイプラインが事前投入したジョブ等) を
+    ディスクの状態から復元する。無ければ None。"""
+    d = JOBS_DIR / job_id
+    if not d.is_dir():
+        return None
+    job = {"stage": "created"}
+    diar_file = d / "diarization.json"
+    if diar_file.exists():
+        try:
+            job["diarization"] = json.loads(diar_file.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+    if (d / "input.mp4").exists():
+        job["stage"] = "uploaded"
+    if "diarization" in job:
+        job["stage"] = "diarized"
+    if (d / "output.mp4").exists():
+        job["stage"] = "done"
+    return job
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -326,8 +441,58 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 job = JOBS.get(job_id)
             if not job:
+                job = disk_job(job_id)
+            if not job:
                 return self._json({"error": "job not found"}, 404)
-            return self._json({k: job.get(k) for k in ("stage", "error", "diarization", "progress")})
+            return self._json({k: job.get(k) for k in ("stage", "error", "diarization", "progress", "silences", "silence_stage")})
+        if path.startswith("/api/jobinfo/"):
+            job_id = path.split("/")[3]
+            d = JOBS_DIR / job_id
+            if not d.is_dir():
+                return self._json({"error": "job not found"}, 404)
+            info = {"job_id": job_id,
+                    "has_video": (d / "input.mp4").exists(),
+                    "has_transcript": (d / "transcript.vtt").exists(),
+                    "has_thumb": (d / "thumb_asset").exists(),
+                    "has_output": (d / "output.mp4").exists()}
+            for key, fname in (("plan", "plan.json"), ("meta", "jobmeta.json")):
+                f = d / fname
+                if f.exists():
+                    try:
+                        info[key] = json.loads(f.read_text(encoding="utf-8"))
+                    except Exception:  # noqa: BLE001
+                        info[key] = None
+            with LOCK:
+                job = JOBS.get(job_id)
+            if not job:
+                job = disk_job(job_id)
+            if job:
+                info["stage"] = job.get("stage")
+                if job.get("diarization"):
+                    info["diarization"] = job["diarization"]
+            return self._json(info)
+        if path.startswith("/api/video/"):
+            job_id = path.split("/")[3]
+            f = job_dir(job_id) / "input.mp4"
+            if not f.exists():
+                return self._json({"error": "video not found"}, 404)
+            return self._file(f, "video/mp4")
+        if path.startswith("/api/thumb/"):
+            job_id = path.split("/")[3]
+            d = job_dir(job_id)
+            f = d / "thumb_asset"
+            if not f.exists():
+                return self._json({"error": "thumb not found"}, 404)
+            import mimetypes
+            ctype = "application/octet-stream"
+            meta_f = d / "jobmeta.json"
+            if meta_f.exists():
+                try:
+                    name = json.loads(meta_f.read_text(encoding="utf-8")).get("asset_name") or ""
+                    ctype = mimetypes.guess_type(name)[0] or ctype
+                except Exception:  # noqa: BLE001
+                    pass
+            return self._file(f, ctype)
         if path.startswith("/api/sample/"):
             _, _, _, job_id, sp = path.split("/")
             f = job_dir(job_id) / "samples" / f"speaker{sp}.mp3"
@@ -344,15 +509,39 @@ class Handler(BaseHTTPRequestHandler):
 
     def _file(self, f: Path, ctype: str, download=False):
         size = f.stat().st_size
-        self.send_response(200)
+        start, end = 0, size - 1
+        status = 200
+        range_hdr = self.headers.get("Range")
+        if range_hdr and range_hdr.startswith("bytes="):
+            try:
+                first, _, last = range_hdr[6:].partition("-")
+                if first:
+                    start = int(first)
+                if last:
+                    end = min(int(last), size - 1)
+                if start > end:
+                    raise ValueError
+                status = 206
+            except ValueError:
+                start, end, status = 0, size - 1, 200
+        self.send_response(status)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         if download:
             self.send_header("Content-Disposition", 'attachment; filename="edited.mp4"')
         self.end_headers()
         with f.open("rb") as fh:
-            while chunk := fh.read(1 << 20):
+            fh.seek(start)
+            left = end - start + 1
+            while left > 0:
+                chunk = fh.read(min(1 << 20, left))
+                if not chunk:
+                    break
                 self.wfile.write(chunk)
+                left -= len(chunk)
 
     def do_PUT(self):
         parts = urlparse(self.path).path.strip("/").split("/")
@@ -390,6 +579,11 @@ class Handler(BaseHTTPRequestHandler):
             params = self._body_json()
             self._run_async(job_id, "diarizing", lambda: self._do_diarize(job_id, params))
             return self._json({"ok": True})
+        if path.startswith("/api/silences/"):
+            job_id = path.split("/")[3]
+            params = self._body_json()
+            self._run_silences(job_id, params)
+            return self._json({"ok": True})
         if path.startswith("/api/process/"):
             job_id = path.split("/")[3]
             params = self._body_json()
@@ -406,6 +600,31 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 with LOCK:
                     JOBS[job_id]["stage"] = "error"
+                    JOBS[job_id]["error"] = str(e)[:500]
+        threading.Thread(target=wrap, daemon=True).start()
+
+    def _run_silences(self, job_id, params):
+        """無音カット候補の検出を非同期で走らせる (stage は触らない)。"""
+        def wrap():
+            with LOCK:
+                JOBS.setdefault(job_id, {})["silence_stage"] = "running"
+            try:
+                import sys
+                sys.path.insert(0, str(BASE))
+                from edit import detect_silences
+                d = job_dir(job_id)
+                min_sec = float(params.get("silence_sec", 3.0))
+                db = int(params.get("silence_db", -38))
+                found = detect_silences(d / "input.mp4", min_sec, db)
+                cands = [{"start": round(s, 3), "end": round(e, 3),
+                          "kind": "silence", "enabled": True}
+                         for s, e in found if e - s >= min_sec - 0.05]
+                with LOCK:
+                    JOBS[job_id]["silences"] = cands
+                    JOBS[job_id]["silence_stage"] = "done"
+            except Exception as e:  # noqa: BLE001
+                with LOCK:
+                    JOBS[job_id]["silence_stage"] = "error"
                     JOBS[job_id]["error"] = str(e)[:500]
         threading.Thread(target=wrap, daemon=True).start()
 
@@ -444,6 +663,11 @@ class Handler(BaseHTTPRequestHandler):
             "silence_cut": bool(params.get("silence_cut", False)),
             "silence_sec": float(params.get("silence_sec", 3.0)),
         }
+        if params.get("presenters") is not None:
+            cfg["presenters"] = [int(p) for p in params["presenters"]]
+        if params.get("disabled_cuts") is not None:
+            cfg["disabled_cuts"] = [[float(a), float(b)]
+                                    for a, b in params["disabled_cuts"]]
         def cb(pct):
             with LOCK:
                 JOBS[job_id]["progress"] = pct

@@ -97,4 +97,45 @@ $E plain.mp4 "$OLDPWD/$THUMB" -o outF.mp4 --config cfgA.json --encoder auto > en
 grep -q "エンコーダ:" enc.log
 check "$(dur outF.mp4)" 11.0 "F encoder auto"
 
+echo "== Case G: 複数登壇者 (presenters で開始点が変わる) =="
+$E plan --video sil.mp4 --transcript sample.vtt --thumb "$OLDPWD/$THUMB" \
+  --silence-cut --silence-sec 3 --intro-sec 2 --outro-sec 2 --dissolve 0.5 \
+  --presenters 0 --out planG0.json > /dev/null
+$E plan --video sil.mp4 --transcript sample.vtt --thumb "$OLDPWD/$THUMB" \
+  --silence-cut --silence-sec 3 --intro-sec 2 --outro-sec 2 --dissolve 0.5 \
+  --presenters 0,1 --out planG01.json > /dev/null
+python3 - <<'PY'
+import json
+p0 = json.load(open("planG0.json"))
+# 話者0 (運営) は5秒以上の発言が無いので、最初の発言の頭 0.0 が開始点
+assert p0["presenters"] == [0] and p0["trim_start"] == 0.0, p0
+assert p0["silence"]["keeps"] == [[0.0, 5.0], [10.0, 20.0]], p0["silence"]
+assert p0["expected_duration"] == 17.5, p0
+p01 = json.load(open("planG01.json"))
+# 複数指定時は「登壇者のうち最初に5秒以上話す人」の頭 = 登壇者の 5.0
+assert p01["presenters"] == [0, 1] and p01["trim_start"] == 5.0, p01
+print("OK   G plan JSON (presenters / trim_start)")
+PY
+$E render --plan planG0.json -o outG.mp4 > /dev/null 2>&1
+check "$(dur outG.mp4)" 17.5 "G render (presenters=[0])"
+
+echo "== Case H: カット候補の無効化 (disabled_cuts で無音を残す) =="
+cat > cfgH.json <<'J'
+{"silence_cut": true, "silence_sec": 3.0, "intro_sec": 2, "outro_sec": 2,
+ "dissolve": 0.5, "disabled_cuts": [[5, 10]]}
+J
+$E plan --video sil.mp4 --thumb "$OLDPWD/$THUMB" --config cfgH.json \
+  --out planH.json > /dev/null
+python3 - <<'PY'
+import json
+p = json.load(open("planH.json"))
+c = p["silence"]["candidates"]
+assert len(c) == 1 and c[0]["enabled"] is False, c
+assert p["silence"]["cuts"] == [] and p["silence"]["keeps"] == [[0.0, 20.0]], p["silence"]
+assert p["expected_duration"] == 23.0, p
+print("OK   H plan JSON (candidates / disabled_cuts)")
+PY
+$E render --plan planH.json -o outH.mp4 > /dev/null 2>&1
+check "$(dur outH.mp4)" 23.0 "H render (silence kept)"
+
 echo "REGRESSION OK"

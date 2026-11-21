@@ -221,6 +221,23 @@ def _keep_segments(silences, start, end, min_sec):
     return keeps, cuts
 
 
+def _suggest_start(speakers, presenters):
+    """指定された登壇者 (複数可) のうち、最初に話し始める位置を返す。
+
+    まず「5秒以上続く発言」の頭を探し、無ければ最初の発言の頭。
+    speakers は transcript / diarize の結果 dict (segments を含む)。
+    """
+    wanted = {int(p) for p in presenters}
+    segs = [s for s in speakers.get("segments", [])
+            if int(s["speaker"]) in wanted]
+    if not segs:
+        return None
+    for s in segs:
+        if float(s["end"]) - float(s["start"]) >= 5:
+            return float(s["start"])
+    return float(segs[0]["start"])
+
+
 def _join_plan(keeps, dissolve, fps):
     """保持区間をつなぐ際の (ディゾルブ秒, xfade offset) のリストと、
     つないだ後の本編長を返す。短い区間ではディゾルブを自動で短くする
@@ -327,10 +344,34 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None)
         from transcript import result_from_transcript
         speakers = result_from_transcript(Path(transcript_path))
 
+    # --- 登壇者 (複数可) ---
+    # cfg["presenters"] で話者インデックスを複数指定できる。未指定なら
+    # 登壇者推定 (紹介パターン優先、無ければ最長話者) の1人を入れる。
+    if cfg.get("presenters") is not None:
+        presenters = [int(p) for p in cfg["presenters"]]
+    elif speakers:
+        guess = speakers.get("presenter_guess",
+                             speakers.get("main_speaker_guess"))
+        presenters = [int(guess)] if guess is not None else []
+    else:
+        presenters = []
+
     # --- 開始点・終了点 ---
+    # 開始点は「指定された登壇者のうち最初に話し始めた人」の位置が基本。
     if cfg.get("trim_start") is not None:
         trim_start = parse_time(cfg["trim_start"])
         trim_source = "config"
+    elif speakers and presenters:
+        sug = _suggest_start(speakers, presenters)
+        if sug is not None:
+            trim_start = sug
+            trim_source = "transcript"
+        elif speakers.get("suggested_trim_start") is not None:
+            trim_start = float(speakers["suggested_trim_start"])
+            trim_source = "transcript"
+        else:
+            trim_start = 0.0
+            trim_source = "default"
     elif speakers and speakers.get("suggested_trim_start") is not None:
         trim_start = float(speakers["suggested_trim_start"])
         trim_source = "transcript"
@@ -346,12 +387,43 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None)
             f"本編が0秒以下です (total={total:.1f}s, start={trim_start}, end={end})")
 
     # --- 無音カット ---
+    # 検出された無音はすべて candidates として plan に残し、
+    # cfg["disabled_cuts"] ([[start, end], ...]) に入った区間は
+    # 「切らない (残す)」として keeps 側に回す。人間がエディタで
+    # 区間ごとに残す/切るを切り替えるための仕組み。
     min_sec = float(cfg.get("silence_sec", 3.0))
     db = int(cfg.get("silence_db", -38))
     sil_enabled = bool(cfg.get("silence_cut", False)) and has_audio
+    candidates = []
     if sil_enabled:
-        keeps, cuts = _keep_segments(
+        _all_keeps, cuts_all = _keep_segments(
             detect_silences(input_video, min_sec, db), trim_start, end, min_sec)
+        disabled = cfg.get("disabled_cuts") or []
+
+        def _is_disabled(c):
+            # クリップで開始/終了がずれた区間とも一致するよう、
+            # 区間長の半分以上が重なっていれば「残す」指定とみなす
+            for d in disabled:
+                overlap = min(c[1], float(d[1])) - max(c[0], float(d[0]))
+                if overlap >= 0.5 * (c[1] - c[0]):
+                    return True
+            return False
+
+        cuts = []
+        for c in cuts_all:
+            enabled = not _is_disabled(c)
+            candidates.append({"start": round(c[0], 3), "end": round(c[1], 3),
+                               "kind": "silence", "enabled": enabled})
+            if enabled:
+                cuts.append(c)
+        keeps = []
+        cur = trim_start
+        for cs, ce in sorted(cuts):
+            if cs > cur:
+                keeps.append((cur, cs))
+            cur = max(cur, ce)
+        if cur < end:
+            keeps.append((cur, end))
         if not keeps:
             raise ValueError("無音カット後に残る区間がありません")
     else:
@@ -392,11 +464,13 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None)
         "end": end,
         "trim_start_source": trim_source,
         "speakers": speakers,
+        "presenters": presenters,
         "silence": {
             "enabled": sil_enabled,
             "min_sec": min_sec,
             "db": db,
             "cuts": [[round(s, 3), round(e, 3)] for s, e in cuts],
+            "candidates": candidates,
             "keeps": [[round(s, 3), round(e, 3)] for s, e in keeps],
         },
         "asset": asset,
@@ -697,6 +771,7 @@ def _plan_cli(argv):
     ap.add_argument("--silence-cut", action="store_true", default=None, help="指定秒数以上の無音をカットする")
     ap.add_argument("--silence-sec", type=float, help="無音カットの最小秒数 (既定3)")
     ap.add_argument("--silence-db", type=int, help="無音判定のしきい値 dB (既定-38)")
+    ap.add_argument("--presenters", help="登壇者の話者インデックス (カンマ区切り、複数可。例: 0,1)")
     args = ap.parse_args(argv)
 
     cfg = _load_cfg(args)
@@ -705,6 +780,8 @@ def _plan_cli(argv):
                    ("outro_sec", args.outro_sec), ("dissolve", args.dissolve),
                    ("asset_type", args.asset_type), ("silence_sec", args.silence_sec),
                    ("silence_db", args.silence_db)])
+    if args.presenters:
+        cfg["presenters"] = [int(x) for x in args.presenters.split(",") if x.strip()]
     if args.silence_cut:
         cfg["silence_cut"] = True
 

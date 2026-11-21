@@ -1,5 +1,13 @@
 __pycache__/
 jobs/
+pipeline/inbox/
+pipeline/outbox/
+pipeline/work/
+pipeline/state.json
+pipeline/demo_inbox/
+pipeline/demo_outbox/
+pipeline/demo_work/
+pipeline/demo_state.json
 input/*
 !input/.gitkeep
 output/*
