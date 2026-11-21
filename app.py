@@ -305,16 +305,23 @@ function renderDiar(presenters){
   renderTimeline();
 }
 let cutCandidates=[];
+let llmDetectInfo=null; // AI検出のステータス {status: ok/skipped/failed, count, detail}
 const SRC_LABEL={silence:'無音', ops:'運営の発話', other:'登壇者以外の発話', llm:'AI検出', user:'手動カット'};
 function renderCuts(){
   $('cutWrap').classList.remove('hidden');
-  if(!cutCandidates.length){ $('cutMsg').textContent='カット候補はありません（タイムラインの区間をタップするとカットにできます）'; }
+  let llmNote='';
+  if(llmDetectInfo){
+    if(llmDetectInfo.status==='ok') llmNote=`AI検出: ${llmDetectInfo.count||0}件`;
+    else if(llmDetectInfo.status==='failed') llmNote=`AI検出: 失敗（${llmDetectInfo.detail||'不明なエラー'}）`;
+    else llmNote=`AI検出: スキップ（${llmDetectInfo.detail||'キー未設定'}）`;
+  }
+  if(!cutCandidates.length){ $('cutMsg').textContent='カット候補はありません（タイムラインの区間をタップするとカットにできます）'+(llmNote?` — ${llmNote}`:''); }
   else{
     const on=cutCandidates.filter(c=>c.enabled).length;
     const parts=Object.keys(SRC_LABEL)
       .map(s=>[SRC_LABEL[s], cutCandidates.filter(c=>c.source===s).length])
       .filter(([,n])=>n>0).map(([l,n])=>`${l} ${n}件`).join(' / ');
-    $('cutMsg').textContent=`カット候補 ${cutCandidates.length}件（うち ${on}件を切る）内訳: ${parts} — タイムラインの区間タップで切り替えてください`;
+    $('cutMsg').textContent=`カット候補 ${cutCandidates.length}件（うち ${on}件を切る）内訳: ${parts} — タイムラインの区間タップで切り替えてください`+(llmNote?` / ${llmNote}`:'');
   }
   renderTimeline();
 }
@@ -328,15 +335,19 @@ async function loadSilences(){
       await new Promise(r=>setTimeout(r,1500));
       const {st}=await pollStatus();
       if(st.silence_stage==='done'){
-        // 再検出しても手動カットとAI検出候補は消さない。
+        llmDetectInfo=st.llm_detection||null;
+        // 再検出しても手動カットは消さない。AI検出候補は、再検出で返って
+        // きたものと範囲が重なる分は新しい方を優先し (重複防止)、返って
+        // こなかった分 (キー未設定で検出し直した場合など) は残す。
         // 「残す」にした候補の無効化状態も、範囲が一致すれば引き継ぐ
-        const keep=cutCandidates.filter(c=>c.source==='user'||c.source==='llm');
-        const prevOff=cutCandidates.filter(c=>!c.enabled&&c.source!=='user'&&c.source!=='llm');
+        const prevOff=cutCandidates.filter(c=>!c.enabled&&c.source!=='user');
         const fetched=(st.silences||[]).map(c=>{
           const n={...c, source:c.source||'silence'};
           if(prevOff.some(p=>Math.abs(p.start-n.start)<0.6&&Math.abs(p.end-n.end)<0.6)) n.enabled=false;
           return n;
         });
+        const keep=cutCandidates.filter(c=>c.source==='user'
+          ||(c.source==='llm'&&!fetched.some(n=>n.source==='llm'&&Math.abs(n.start-c.start)<0.6&&Math.abs(n.end-c.end)<0.6)));
         cutCandidates=fetched.concat(keep);
         break;
       }
@@ -575,6 +586,7 @@ $('runBtn').onclick=async()=>{
       if(sil.min_sec!=null) $('silenceSec').value=sil.min_sec;
       updateDur();
       $('analyzeMsg').innerHTML='<span class="ok">カット案を読み込みました</span> 開始点・無音カットは自動判定済みです。違うと思ったら直してください。';
+      if(info.plan.llm_detection) llmDetectInfo=info.plan.llm_detection;
       if(sil.candidates){ cutCandidates=sil.candidates.map(normCand); renderCuts(); }
       renderTimeline();
     }
@@ -655,7 +667,7 @@ class Handler(BaseHTTPRequestHandler):
                 job = disk_job(job_id)
             if not job:
                 return self._json({"error": "job not found"}, 404)
-            return self._json({k: job.get(k) for k in ("stage", "error", "diarization", "progress", "silences", "silence_stage")})
+            return self._json({k: job.get(k) for k in ("stage", "error", "diarization", "progress", "silences", "silence_stage", "llm_detection")})
         if path.startswith("/api/jobinfo/"):
             job_id = path.split("/")[3]
             d = JOBS_DIR / job_id
@@ -818,8 +830,12 @@ class Handler(BaseHTTPRequestHandler):
         """カット候補の検出を非同期で走らせる (stage は触らない)。
 
         無音候補に加え、文字起こしがあればデフォルト保持ポリシーの候補
-        (登壇者以外の発話: source=ops/other) も返す。生成規則は
-        edit.compute_plan と同じ (edit._policy_candidates)。
+        (登壇者以外の発話: source=ops/other) と、LLM検出の候補
+        (もたつき・トラブル・本題外: source=llm) も返す。ポリシー候補の
+        生成規則は edit.compute_plan と同じ (edit._policy_candidates)。
+        LLM検出は APIキーが無ければスキップし、失敗しても他の候補は返す。
+        検出ステータスは JOBS[job_id]["llm_detection"] に記録する
+        (形式は edit.compute_plan の plan["llm_detection"] と同じ)。
         """
         def wrap():
             with LOCK:
@@ -835,8 +851,11 @@ class Handler(BaseHTTPRequestHandler):
                 cands = [{"start": round(s, 3), "end": round(e, 3),
                           "kind": "silence", "source": "silence", "enabled": True}
                          for s, e in found if e - s >= min_sec - 0.05]
+                llm_status = {"status": "skipped",
+                              "detail": "transcript がありません"}
                 tpath = d / "transcript.vtt"
                 if tpath.exists() and tpath.stat().st_size > 0:
+                    cues = None
                     try:
                         from transcript import build_result, parse_transcript
                         from edit import _policy_candidates
@@ -856,8 +875,34 @@ class Handler(BaseHTTPRequestHandler):
                         cands.sort(key=lambda c: c["start"])
                     except Exception:  # noqa: BLE001
                         pass  # ポリシー候補が作れなくても無音候補は返す
+                    # LLM検出 (もたつき・トラブル・本題外)。97分級の
+                    # transcript では窓分割で複数回のAPIコールになり時間が
+                    # かかるが、この関数は非同期スレッドで動くので待ってよい
+                    try:
+                        import llm_detect
+                        client = llm_detect.get_client_from_env()
+                        if client is None:
+                            llm_status = {
+                                "status": "skipped",
+                                "detail": "APIキー未設定 (GEMINI_API_KEY)"}
+                        elif not cues:
+                            llm_status = {
+                                "status": "skipped",
+                                "detail": "transcript を読めませんでした"}
+                        else:
+                            detected = llm_detect.detect_ranges(cues, client)
+                            for cand in detected:
+                                cands.append({**cand, "enabled": True})
+                            cands.sort(key=lambda c: c["start"])
+                            llm_status = {
+                                "status": "ok", "count": len(detected),
+                                "client": getattr(client, "name", "unknown")}
+                    except Exception as e:  # noqa: BLE001
+                        llm_status = {"status": "failed",
+                                      "detail": str(e)[:200]}
                 with LOCK:
                     JOBS[job_id]["silences"] = cands
+                    JOBS[job_id]["llm_detection"] = llm_status
                     JOBS[job_id]["silence_stage"] = "done"
             except Exception as e:  # noqa: BLE001
                 with LOCK:
