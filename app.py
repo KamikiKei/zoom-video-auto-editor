@@ -50,9 +50,25 @@ HTML = r"""<!DOCTYPE html>
   button.sub{background:#fff;color:var(--acc);border:1px solid var(--acc);padding:7px 12px;font-size:13px}
   button:disabled{opacity:.45;cursor:default}
   .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:8px 0}
-  .timeline{position:relative;height:34px;background:#eee;border-radius:7px;overflow:hidden;margin:10px 0;cursor:pointer}
-  .seg{position:absolute;top:0;height:100%}
-  .seg.sp0{background:#5b8dd9}.seg.sp1{background:var(--acc2)}.seg.sp2{background:#63b06a}.seg.sp3{background:#b06ab0}
+  #tlScroll{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:#fff;margin-top:6px}
+  #tlCanvas{position:relative;height:92px;min-width:100%;cursor:pointer}
+  .tl-ruler{position:absolute;top:0;left:0;right:0;height:16px;border-bottom:1px solid #e3e6ea;overflow:hidden}
+  .tl-tick{position:absolute;top:1px;height:14px;font-size:10px;color:#888;border-left:1px solid #ccc;padding-left:3px;white-space:nowrap}
+  .tl-lane{position:absolute;left:0;right:0;height:26px}
+  #tlLaneEdit{top:20px;background:#eef1f4}
+  #tlLaneSpk{top:52px;background:#f7f7f7}
+  .tl-blk{position:absolute;top:0;height:100%}
+  .tl-keep{background:#c9d6e2}
+  .tl-cut{background:repeating-linear-gradient(45deg,#d9534f 0 6px,#b52b27 6px 12px);cursor:pointer}
+  .tl-keepcand{background:#f2cf7e;cursor:pointer}
+  .tl-out{background:rgba(0,0,0,.28)}
+  .tl-spk{cursor:pointer}
+  .tl-spk.sp0{background:#5b8dd9}.tl-spk.sp1{background:var(--acc2)}.tl-spk.sp2{background:#63b06a}.tl-spk.sp3{background:#b06ab0}
+  .tl-lanehint{font-size:11px;color:#999;padding:5px 8px}
+  #tlPlayhead{position:absolute;top:0;bottom:0;width:2px;background:#e02424;z-index:5;pointer-events:none}
+  #tlStartMarker{position:absolute;top:0;bottom:0;width:12px;margin-left:-6px;z-index:6;cursor:ew-resize}
+  #tlStartMarker::before{content:'';position:absolute;top:0;bottom:0;left:5px;width:2px;background:#1d7a35}
+  #tlStartMarker::after{content:'開始';position:absolute;top:0;left:8px;background:#1d7a35;color:#fff;font-size:10px;padding:1px 4px;border-radius:3px;white-space:nowrap}
   .spcard{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:8px 0}
   .dot{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:6px}
   .d0{background:#5b8dd9}.d1{background:var(--acc2)}.d2{background:#63b06a}.d3{background:#b06ab0}
@@ -68,6 +84,25 @@ HTML = r"""<!DOCTYPE html>
   <div class="drop" id="videoDrop">動画 (mp4) をここにドロップ / クリックで選択<input type="file" id="videoFile" accept="video/*" class="hidden"></div>
   <div class="msg" id="videoName"></div>
   <video id="player" controls class="hidden"></video>
+  <div id="tlWrap" class="hidden">
+    <div class="row" style="justify-content:space-between;margin:10px 0 0">
+      <span class="msg"><b>タイムライン</b>　<span id="tlCurTime"></span></span>
+      <span>
+        <button class="sub" id="tlZoomOutBtn">− 縮小</button>
+        <input type="range" id="tlZoomSlider" min="0" max="100" value="0" style="width:120px;vertical-align:middle">
+        <button class="sub" id="tlZoomInBtn">＋ 拡大</button>
+        <button class="sub" id="tlFitBtn">全体表示</button>
+      </span>
+    </div>
+    <div id="tlScroll"><div id="tlCanvas">
+      <div class="tl-ruler" id="tlRuler"></div>
+      <div class="tl-lane" id="tlLaneEdit"></div>
+      <div class="tl-lane" id="tlLaneSpk"></div>
+      <div id="tlPlayhead"></div>
+      <div id="tlStartMarker"></div>
+    </div></div>
+    <div class="msg" style="margin-top:6px">上段＝編集（水色：残す／赤：切る／黄：カット候補だけど残す）。赤・黄の区間をクリックすると 切る⇔残す が切り替わり、その位置を再生します。下段＝話者（クリックで再生）。緑＝開始点（ドラッグで移動）。タイムラインのクリックで移動、ボタン／スライダー／Ctrl+ホイールで拡大縮小。</div>
+  </div>
   <div style="height:10px"></div>
   <div class="drop" id="thumbDrop">OP/ED素材（画像 or 動画）をドロップ / クリックで選択<input type="file" id="thumbFile" accept="image/*,video/*" class="hidden"></div>
   <div class="row">
@@ -84,7 +119,6 @@ HTML = r"""<!DOCTYPE html>
   <div class="msg" id="transcriptName"></div>
   <div class="row"><button id="analyzeBtn" disabled>話者を解析する</button><span class="msg" id="analyzeMsg"></span></div>
   <progress id="upProg" class="hidden" max="100" value="0"></progress>
-  <div class="timeline hidden" id="timeline"></div>
   <div id="speakerCards"></div>
   <div class="row">
     <label>開始 <input type="text" id="startInput" placeholder="0:00"></label>
@@ -107,8 +141,7 @@ HTML = r"""<!DOCTYPE html>
     <label><input type="number" id="silenceSec" value="3" step="0.5" min="1" style="width:60px"> 秒以上の無音を除去</label>
   </div>
   <div id="cutWrap" class="hidden">
-    <div class="msg">カット候補（無音区間）。チェックが入った区間を切ります。外した区間は残します。時刻をクリックするとその位置を再生します。</div>
-    <div id="cutList"></div>
+    <div class="msg">カット候補（無音区間）は上のタイムラインに表示されます。赤い区間が「切る」、黄色は「候補だけど残す」。区間をクリックすると 切る⇔残す が切り替わり、その位置を再生して確認できます（画面共有中の音声など、消したくない区間は黄色に戻してください）。</div>
     <div class="row"><button class="sub" id="refetchCutsBtn">カット候補を再検出</button><span class="msg" id="cutMsg"></span></div>
   </div>
 </div>
@@ -239,19 +272,10 @@ function updateStartFromPresenters(){
   const segs=diar.segments.filter(sg=>ps.includes(sg.speaker));
   if(!segs.length) return;
   const seg=segs.find(sg=>(sg.end-sg.start)>=5)||segs[0];
-  $('startInput').value=fmt(seg.start); updateDur();
+  $('startInput').value=fmt(seg.start); updateDur(); renderTimeline();
   $('analyzeMsg').innerHTML=`<span class="ok">開始を ${fmt(seg.start)} にセットしました</span>（選んだ登壇者の最初の長い発言の頭）。プレビューで確認して、違うと思ったら手で直してください。`;
 }
 function renderDiar(presenters){
-  const tl=$('timeline'); tl.innerHTML=''; tl.classList.remove('hidden');
-  diar.segments.forEach(sg=>{
-    const d=document.createElement('div'); d.className='seg sp'+sg.speaker;
-    d.style.left=(sg.start/videoDur*100)+'%'; d.style.width=((sg.end-sg.start)/videoDur*100)+'%';
-    d.title=`${(diar.names&&diar.names[sg.speaker])||('話者'+(sg.speaker+1))} ${fmt(sg.start)}〜${fmt(sg.end)}`;
-    d.onclick=()=>{ $('player').currentTime=sg.start; $('player').play(); };
-    tl.appendChild(d);
-  });
-  tl.onclick=e=>{ const r=tl.getBoundingClientRect(); $('player').currentTime=(e.clientX-r.left)/r.width*videoDur; };
   const wrap=$('speakerCards'); wrap.innerHTML='';
   const defaults = presenters!=null ? presenters.map(Number)
     : [diar.presenter_guess!=null ? diar.presenter_guess : diar.main_speaker_guess];
@@ -268,23 +292,17 @@ function renderDiar(presenters){
   });
   wrap.querySelectorAll('input[name=presenters]').forEach(cb=>{ cb.onchange=updateStartFromPresenters; });
   updateStartFromPresenters();
+  renderTimeline();
 }
 let cutCandidates=[];
 function renderCuts(){
-  const wrap=$('cutList'); wrap.innerHTML='';
   $('cutWrap').classList.remove('hidden');
-  if(!cutCandidates.length){ $('cutMsg').textContent='カット候補はありません'; return; }
-  $('cutMsg').textContent='';
-  cutCandidates.forEach((c,i)=>{
-    const row=document.createElement('div'); row.className='row';
-    row.innerHTML=`<label><input type="checkbox" class="cutchk" data-i="${i}"${c.enabled?' checked':''}> 切る</label>`
-      +`<span class="msg" style="cursor:pointer;text-decoration:underline">${fmt(c.start)} 〜 ${fmt(c.end)}（無音 ${(c.end-c.start).toFixed(1)}秒）</span>`;
-    row.querySelector('span').onclick=()=>{ $('player').currentTime=c.start; $('player').play(); };
-    wrap.appendChild(row);
-  });
-  wrap.querySelectorAll('.cutchk').forEach(chk=>{
-    chk.onchange=()=>{ cutCandidates[Number(chk.dataset.i)].enabled=chk.checked; };
-  });
+  if(!cutCandidates.length){ $('cutMsg').textContent='カット候補はありません'; }
+  else{
+    const on=cutCandidates.filter(c=>c.enabled).length;
+    $('cutMsg').textContent=`カット候補 ${cutCandidates.length}件（うち ${on}件を切る）— タイムラインの区間クリックで切り替えてください`;
+  }
+  renderTimeline();
 }
 async function loadSilences(){
   if(!jobId) return;
@@ -301,6 +319,133 @@ async function loadSilences(){
     renderCuts();
   }catch(e){ $('cutMsg').textContent=e.message; }
 }
+// ===== タイムライン (上段=編集レーン / 下段=話者レーン) =====
+// データフローは従来どおり: 区間の取捨は cutCandidates[i].enabled を切り替え、
+// 「編集する」時に enabled=false の候補が disabled_cuts として渡る。
+let tlPx=0; // 0 = 全体表示 (fit)。>0 は px/秒
+const TL_MAXPX=120; // 最大拡大 (1秒=120px まで寄れる)
+let tlDragMovedAt=0;
+function tlFitPx(){ const w=$('tlScroll').clientWidth||800; return videoDur>0? w/videoDur : 1; }
+function tlPxPerSec(){ return tlPx>0? tlPx : tlFitPx(); }
+function tlAddBlock(parent,a,b,cls){
+  if(b<=a) return null;
+  const px=tlPxPerSec();
+  const d=document.createElement('div'); d.className='tl-blk '+cls;
+  d.style.left=(a*px)+'px'; d.style.width=Math.max(2,(b-a)*px)+'px';
+  parent.appendChild(d); return d;
+}
+function seekPlay(t){ const p=$('player'); p.currentTime=t; p.play(); }
+function renderTimeline(){
+  if(!videoDur) return;
+  const has = !!diar || cutCandidates.length>0;
+  $('tlWrap').classList.toggle('hidden', !has);
+  if(!has) return;
+  const px=tlPxPerSec();
+  $('tlCanvas').style.width=Math.max(Math.ceil(videoDur*px), $('tlScroll').clientWidth)+'px';
+  const ruler=$('tlRuler'); ruler.innerHTML='';
+  const steps=[1,2,5,10,15,30,60,120,300,600,1800];
+  const step=steps.find(s=>s*px>=70)||1800;
+  for(let t=0;t<=videoDur;t+=step){
+    const d=document.createElement('div'); d.className='tl-tick';
+    d.style.left=(t*px)+'px'; d.textContent=fmt(t); ruler.appendChild(d);
+  }
+  renderEditLane(); renderSpkLane();
+  positionPlayhead(); positionStartMarker(); syncZoomSlider();
+}
+function renderEditLane(){
+  const lane=$('tlLaneEdit'); lane.innerHTML='';
+  const sv=parseT($('startInput').value), ev=parseT($('endInput').value);
+  const s=sv==null?0:sv, e=ev==null?videoDur:ev;
+  tlAddBlock(lane,0,s,'tl-out'); tlAddBlock(lane,e,videoDur,'tl-out');
+  let cur=s;
+  const cuts=cutCandidates.filter(c=>c.enabled).slice().sort((a,b)=>a.start-b.start);
+  for(const c of cuts){ if(c.start>cur) tlAddBlock(lane,cur,Math.min(c.start,e),'tl-keep'); cur=Math.max(cur,c.end); if(cur>=e) break; }
+  if(cur<e) tlAddBlock(lane,cur,e,'tl-keep');
+  cutCandidates.forEach(c=>{
+    const d=tlAddBlock(lane,c.start,c.end, c.enabled?'tl-cut':'tl-keepcand');
+    if(!d) return;
+    d.title=`無音 ${fmt(c.start)}〜${fmt(c.end)}（${(c.end-c.start).toFixed(1)}秒）クリックで「${c.enabled?'残す':'切る'}」に切替`;
+    d.onclick=ev2=>{ ev2.stopPropagation(); c.enabled=!c.enabled; renderCuts(); seekPlay(c.start); };
+  });
+}
+function renderSpkLane(){
+  const lane=$('tlLaneSpk'); lane.innerHTML='';
+  if(!diar){ lane.innerHTML='<div class="tl-lanehint">話者を解析すると発話区間がここに表示されます</div>'; return; }
+  const sel=selectedPresenters();
+  diar.segments.forEach(sg=>{
+    const d=tlAddBlock(lane,sg.start,sg.end,'tl-spk sp'+sg.speaker);
+    if(!d) return;
+    if(sel.length && !sel.includes(sg.speaker)) d.style.opacity=.28;
+    d.title=`${(diar.names&&diar.names[sg.speaker])||('話者'+(sg.speaker+1))} ${fmt(sg.start)}〜${fmt(sg.end)}`;
+    d.onclick=ev=>{ ev.stopPropagation(); seekPlay(sg.start); };
+  });
+}
+function positionPlayhead(){
+  const p=$('player'); if(!p) return;
+  $('tlPlayhead').style.left=((p.currentTime||0)*tlPxPerSec())+'px';
+  const ct=$('tlCurTime'); if(ct) ct.textContent=`再生位置 ${fmt(p.currentTime||0)} / ${fmt(videoDur)}`;
+}
+function positionStartMarker(){
+  const s=parseT($('startInput').value); const m=$('tlStartMarker');
+  if(s==null){ m.style.display='none'; return; }
+  m.style.display=''; m.style.left=(s*tlPxPerSec())+'px';
+}
+function syncZoomSlider(){
+  const fit=tlFitPx(), maxr=TL_MAXPX/fit, sl=$('tlZoomSlider');
+  if(maxr<=1){ sl.value=0; return; }
+  sl.value=Math.round(100*Math.log(tlPxPerSec()/fit)/Math.log(maxr));
+}
+function tlZoomTo(px, centerTime){
+  const sc=$('tlScroll');
+  const ct = centerTime!=null? centerTime : (sc.scrollLeft+sc.clientWidth/2)/tlPxPerSec();
+  tlPx=Math.min(TL_MAXPX, Math.max(tlFitPx(), px));
+  renderTimeline();
+  sc.scrollLeft=ct*tlPx - sc.clientWidth/2;
+}
+$('tlZoomInBtn').onclick=()=>tlZoomTo(tlPxPerSec()*1.5);
+$('tlZoomOutBtn').onclick=()=>tlZoomTo(tlPxPerSec()/1.5);
+$('tlFitBtn').onclick=()=>{ tlPx=0; renderTimeline(); $('tlScroll').scrollLeft=0; };
+$('tlZoomSlider').oninput=e=>{
+  const fit=tlFitPx(), maxr=TL_MAXPX/fit; if(maxr<=1) return;
+  tlZoomTo(fit*Math.pow(maxr, Number(e.target.value)/100));
+};
+$('tlScroll').addEventListener('wheel', e=>{
+  if(!e.ctrlKey) return;
+  e.preventDefault();
+  const cv=$('tlCanvas').getBoundingClientRect();
+  const t=(e.clientX-cv.left)/tlPxPerSec();
+  const sc=$('tlScroll');
+  tlZoomTo(tlPxPerSec()*(e.deltaY<0?1.25:1/1.25), t);
+  sc.scrollLeft = t*tlPx - (e.clientX - sc.getBoundingClientRect().left);
+},{passive:false});
+$('tlCanvas').onclick=e=>{
+  if(Date.now()-tlDragMovedAt<300) return;
+  const r=$('tlCanvas').getBoundingClientRect();
+  const t=(e.clientX-r.left)/tlPxPerSec();
+  if(t>=0&&t<=videoDur) $('player').currentTime=t;
+};
+$('player').addEventListener('timeupdate', ()=>{
+  positionPlayhead();
+  const sc=$('tlScroll'), x=($('player').currentTime||0)*tlPxPerSec();
+  if(!$('player').paused && tlPx>0 && (x<sc.scrollLeft||x>sc.scrollLeft+sc.clientWidth)) sc.scrollLeft=x-40;
+});
+// 開始点マーカーのドラッグ (1秒単位)
+(function(){
+  const m=$('tlStartMarker'); let dragging=false;
+  m.addEventListener('pointerdown', e=>{ dragging=true; try{m.setPointerCapture(e.pointerId);}catch(_){} e.preventDefault(); e.stopPropagation(); });
+  m.addEventListener('pointermove', e=>{
+    if(!dragging) return;
+    const r=$('tlCanvas').getBoundingClientRect();
+    let t=(e.clientX-r.left)/tlPxPerSec();
+    t=Math.max(0,Math.min(videoDur,t));
+    $('startInput').value=fmt(t); positionStartMarker();
+  });
+  m.addEventListener('pointerup', ()=>{ if(dragging){ dragging=false; tlDragMovedAt=Date.now(); updateDur(); renderTimeline(); } });
+})();
+$('startInput').addEventListener('input', ()=>renderTimeline());
+$('endInput').addEventListener('input', ()=>renderTimeline());
+window.addEventListener('resize', ()=>{ if(tlPx===0) renderTimeline(); });
+
 $('refetchCutsBtn').onclick=()=>loadSilences();
 $('runBtn').onclick=async()=>{
   const btn=$('runBtn'); btn.disabled=true; $('runMsg').textContent='準備中…';
@@ -366,6 +511,7 @@ $('runBtn').onclick=async()=>{
       updateDur();
       $('analyzeMsg').innerHTML='<span class="ok">カット案を読み込みました</span> 開始点・無音カットは自動判定済みです。違うと思ったら直してください。';
       if(sil.candidates){ cutCandidates=sil.candidates; renderCuts(); }
+      renderTimeline();
     }
     $('analyzeBtn').disabled=false;
     $('runBtn').disabled=false;
