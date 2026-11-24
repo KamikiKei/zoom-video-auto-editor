@@ -291,24 +291,49 @@ def _merge(cands):
 
 
 def detect_ranges(cues, client, window_sec: float = 600.0,
-                  overlap_sec: float = 60.0):
+                  overlap_sec: float = 60.0, stats: dict = None):
     """キュー列全体に対して検出し、カット候補 dict のリストを返す。
 
     cues は transcript.parse_transcript の戻り (start/end/speaker/text)。
     戻り値の各要素は {"start", "end", "kind", "source": "llm",
     "reason", "confidence"} で、enabled は呼び出し側が付ける。
-    クライアントが例外を投げたらそのまま伝播する (呼び出し側で status 化)。
+
+    窓 (window) ごとに問い合わせる。1つの窓が失敗 (タイムアウト等) しても
+    その窓だけをスキップして残りの窓の候補は活かす。全窓が失敗した場合
+    のみ、最初の例外を伝播する (呼び出し側で status 化)。
+    stats dict が渡されれば windows_total / windows_ok / windows_failed /
+    partial (一部失敗したか) を書き込む。
     """
     indexed = [dict(c, index=i) for i, c in enumerate(cues)]
     by_index = {c["index"]: c for c in indexed}
     found = []
     wins = _windows(indexed, window_sec, overlap_sec)
+    failures = []
     for wi, (a, b) in enumerate(wins, 1):
         # 窓ごとに進捗を出す (長い動画では窓が10個前後になり、
         # 無言だと「止まった」ように見えるため)
         print(f"AI検出: 窓 {wi}/{len(wins)} を問い合わせ中…", flush=True)
-        items = client.detect_window(indexed[a:b])
+        try:
+            items = client.detect_window(indexed[a:b])
+        except Exception as e:  # noqa: BLE001 - 窓単位で失敗を吸収する
+            failures.append(e)
+            print(f"AI検出: 窓 {wi}/{len(wins)} は失敗したためスキップします: "
+                  f"{str(e)[:100]}", flush=True)
+            continue
         found.extend(_validate_items(items, by_index))
+    if stats is not None:
+        stats["windows_total"] = len(wins)
+        stats["windows_ok"] = len(wins) - len(failures)
+        stats["windows_failed"] = len(failures)
+        stats["partial"] = bool(failures) and len(failures) < len(wins)
+    if wins and len(failures) == len(wins):
+        # 全窓失敗は検出自体の失敗として従来通り例外を伝播する
+        raise failures[0]
     merged = _merge(found)
-    print(f"AI検出: 完了しました（候補 {len(merged)} 件）", flush=True)
+    if failures:
+        print(f"AI検出: 一部の窓が失敗しました"
+              f"（{len(wins) - len(failures)}/{len(wins)} 窓成功、"
+              f"候補 {len(merged)} 件）", flush=True)
+    else:
+        print(f"AI検出: 完了しました（候補 {len(merged)} 件）", flush=True)
     return merged

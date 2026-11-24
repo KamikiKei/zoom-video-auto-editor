@@ -245,6 +245,63 @@ $E plain.mp4 "$OLDPWD/$THUMB" -o outL.mp4 --config cfgL.json > /dev/null 2>&1
 # 保持 [3,13] の10s + 2 + 2 - 0.5*2 = 13.0
 check "$(dur outL.mp4)" 13.0 "L legacy fallback (user cut, silence off)"
 
+checktol() { # $1=実測 $2=期待 $3=ラベル $4=許容誤差
+  python3 -c "import sys; sys.exit(0 if abs(float('$1') - float('$2')) <= float('$4') else 1)" \
+    && echo "OK   $3: $1 (expect $2)" || { echo "FAIL $3: $1 (expect $2)"; exit 1; }
+}
+
+echo "== Case M: 保持区間が多い plan の分割方式 + 動画素材バリエーション =="
+# 回帰防止: 保持区間を1つのグラフで全部 xfade 接続すると、後ろの区間の
+# フレームがキューに溜まり続けてメモリを使い切り、ffmpeg が kill される
+# (実素材 1080p・50区間・本編76分で発生)。分割方式 (ボディ断片 +
+# トランジション断片を個別に書き出し、concat で連結。断片の音声は
+# AAC プライミング漏れを避けるため PCM で書き、連結時に再エンコード)
+# で有界メモリ・正確な尺に収まることを確認する。
+# big: 150秒、音声は 音1.5s / 無音1.0s の繰り返し -> 保持区間が約60個できる
+ffmpeg -y -v error -f lavfi -i testsrc2=size=320x180:rate=30:duration=150 \
+  -f lavfi -i "aevalsrc='if(lt(mod(t,2.5),1.5),0.3*sin(2*PI*440*t),0)':s=48000:d=150" \
+  -c:v libx264 -crf 23 -preset veryfast -pix_fmt yuv420p -c:a aac big.mp4
+# 素材バリエーション (各5秒): 音声あり同スペック / 音声なし / fps・解像度違い / その両方
+ffmpeg -y -v error -f lavfi -i testsrc=size=640x360:rate=30:duration=5 \
+  -f lavfi -i "sine=frequency=880:sample_rate=48000:duration=5" \
+  -c:v libx264 -crf 23 -preset veryfast -pix_fmt yuv420p -c:a aac assetM_audio.mp4
+ffmpeg -y -v error -f lavfi -i testsrc=size=640x360:rate=30:duration=5 \
+  -c:v libx264 -crf 23 -preset veryfast -pix_fmt yuv420p assetM_noaudio.mp4
+ffmpeg -y -v error -f lavfi -i testsrc=size=320x240:rate=15:duration=5 \
+  -f lavfi -i "sine=frequency=880:sample_rate=44100:duration=5" \
+  -c:v libx264 -crf 23 -preset veryfast -pix_fmt yuv420p -c:a aac assetM_diff.mp4
+ffmpeg -y -v error -f lavfi -i testsrc=size=320x240:rate=15:duration=5 \
+  -c:v libx264 -crf 23 -preset veryfast -pix_fmt yuv420p assetM_diff_noaudio.mp4
+$E plan --video big.mp4 --thumb assetM_audio.mp4 --silence-cut --silence-sec 0.9 \
+  --dissolve 0.5 --out planM.json > planM.log
+python3 - <<'PY'
+import json
+p = json.load(open("planM.json"))
+keeps = p["silence"]["keeps"]
+assert len(keeps) >= 40, f"keeps={len(keeps)}"
+open("expectedM.txt", "w").write(str(p["expected_duration"]))
+print(f"OK   M plan (keeps={len(keeps)}, expected={p['expected_duration']})")
+PY
+for v in audio noaudio diff diff_noaudio; do
+  $E render --plan planM.json --thumb assetM_$v.mp4 -o outM_$v.mp4 > renderM_$v.log 2>&1
+  grep -q "分割方式" renderM_$v.log || { echo "FAIL M render ($v): 分割方式が使われていない"; cat renderM_$v.log; exit 1; }
+  checktol "$(dur outM_$v.mp4)" "$(cat expectedM.txt)" "M render ($v, smart)" 0.6
+done
+
+echo "== Case N: 1パス方式での動画素材バリエーション =="
+# 小規模 plan の 1パスでも、音声なし素材 / fps・解像度違い素材が扱えること
+ffmpeg -y -v error -f lavfi -i testsrc=size=640x360:rate=30:duration=2 \
+  -c:v libx264 -crf 23 -preset veryfast -pix_fmt yuv420p assetN_noaudio.mp4
+ffmpeg -y -v error -f lavfi -i testsrc=size=320x240:rate=15:duration=2 \
+  -f lavfi -i "sine=frequency=880:sample_rate=44100:duration=2" \
+  -c:v libx264 -crf 23 -preset veryfast -pix_fmt yuv420p -c:a aac assetN_diff.mp4
+$E plain.mp4 assetN_noaudio.mp4 -o outN1.mp4 --config cfgC.json > n1.log 2>&1
+grep -q "1パス" n1.log || { echo "FAIL N: 1パスで書けていない"; cat n1.log; exit 1; }
+check "$(dur outN1.mp4)" 11.0 "N 1pass (no-audio asset)"
+$E plain.mp4 assetN_diff.mp4 -o outN2.mp4 --config cfgC.json > n2.log 2>&1
+grep -q "1パス" n2.log || { echo "FAIL N: 1パスで書けていない"; cat n2.log; exit 1; }
+check "$(dur outN2.mp4)" 11.0 "N 1pass (diff fps/size asset)"
+
 echo "== AI検出・ポリシーの単体テスト (モック/フェイクHTTP) =="
 python3 "$OLDPWD/test/test_ai_detect.py" > ai_detect.log 2>&1 \
   && echo "OK   test_ai_detect.py" || { cat ai_detect.log; exit 1; }

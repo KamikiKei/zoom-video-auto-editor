@@ -292,6 +292,83 @@ def test_compute_plan_integration():
           str(plan4["llm_detection"]))
 
 
+def test_partial_window_failure():
+    # 3窓に分かれる transcript で、窓2だけがタイムアウトするケース。
+    # 失敗した窓はスキップされ、成功した窓の候補は活きること。
+    cues = []
+    for i in range(200):
+        cues.append({"start": i * 12.0, "end": i * 12.0 + 5.0,
+                     "speaker": "登壇者", "text": "発表の内容です。"})
+    cues[10]["text"] = "聞こえますか。"    # 窓1のトラブル発話
+    cues[150]["text"] = "聞こえますか。"   # 窓3のトラブル発話
+
+    class FlakyClient(llm_detect.MockLLMClient):
+        name = "flaky"
+
+        def __init__(self):
+            self.windows = 0
+
+        def detect_window(self, w):
+            self.windows += 1
+            if self.windows == 2:
+                raise TimeoutError("read timeout")
+            return super().detect_window(w)
+
+    client = FlakyClient()
+    stats = {}
+    found = llm_detect.detect_ranges(cues, client, window_sec=600,
+                                     overlap_sec=60, stats=stats)
+    check("partial: 一部窓の失敗でも detect_ranges は例外を投げない",
+          client.windows >= 3, f"windows={client.windows}")
+    check("partial: stats に窓の成否が記録される",
+          stats.get("windows_total", 0) >= 3
+          and stats.get("windows_failed") == 1
+          and stats.get("partial") is True, str(stats))
+    trouble = [c for c in found if c["kind"] == "trouble"]
+    check("partial: 成功した窓 (1と3) の候補は活きる",
+          len(trouble) == 2, str(trouble))
+
+    # 全窓失敗なら従来通り例外が伝播する
+    class AllBrokenClient:
+        name = "all-broken"
+
+        def detect_window(self, w):
+            raise RuntimeError("API down")
+
+    raised = False
+    try:
+        llm_detect.detect_ranges(cues, AllBrokenClient(),
+                                 window_sec=600, overlap_sec=60)
+    except RuntimeError:
+        raised = True
+    check("partial: 全窓失敗なら例外が伝播する", raised)
+
+    # plan 側: 部分失敗でも status=ok で、detail に「N窓中M窓成功」が残る
+    work = Path(tempfile.mkdtemp())
+    _make_video(work)
+    lines = ["WEBVTT", ""]
+    for i in range(200):
+        s, e = i * 12.0, i * 12.0 + 5.0
+
+        def ts(sec):
+            return (f"{int(sec // 3600):02d}:{int(sec // 60) % 60:02d}:"
+                    f"{sec % 60:06.3f}")
+
+        lines += [str(i + 1), f"{ts(s)} --> {ts(e)}",
+                  f"登壇者: 発表の内容です。", ""]
+    long_vtt = _write_vtt("\n".join(lines))
+    plan = edit_mod.compute_plan(
+        work / "plain.mp4", {"intro_sec": 2, "outro_sec": 2, "dissolve": 0.5},
+        transcript_path=long_vtt, thumb=BASE / "test" / "thumb.png",
+        llm_client=FlakyClient())
+    det = plan["llm_detection"]
+    check("partial: plan の llm_detection は ok のまま",
+          det["status"] == "ok", str(det))
+    check("partial: plan の detail に窓の成功数が残る",
+          "窓中" in det.get("detail", "") and "窓成功" in det.get("detail", ""),
+          str(det))
+
+
 def main():
     test_mock_detection()
     test_mock_fumbling()
@@ -300,6 +377,7 @@ def main():
     test_env_client_selection()
     test_policy_candidates()
     test_compute_plan_integration()
+    test_partial_window_failure()
     if FAILED:
         print(f"\nAI DETECT TEST FAILED: {FAILED}")
         return 1

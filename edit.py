@@ -106,6 +106,42 @@ def _progress(msg: str):
     print(msg, flush=True)
 
 
+# ffmpeg の stderr から「本当のエラー行」を拾うためのパターン。
+# 失敗時に末尾数百文字だけ見ても原因が分からない (ストリーム記述の断片しか
+# 残らない) ことがあったため、エラーらしい行を別途抽出して例外に含める。
+_FFMPEG_ERROR_PATTERNS = (
+    "error", "invalid", "failed", "failure", "matches no streams",
+    "could not", "cannot", "no such file", "permission denied",
+    "conversion failed", "not divisible", "does not match",
+    "no stream", "undefined", "killed",
+)
+
+
+def _ffmpeg_error_summary(err_text: str, returncode: int) -> str:
+    """ffmpeg の stderr 全文から、例外メッセージ用の要約を作る。
+    エラー行 (最大10行) + 末尾1500文字 + 終了コードのヒントを含む。"""
+    lines = [ln.strip() for ln in err_text.splitlines() if ln.strip()]
+    err_lines = []
+    for ln in lines:
+        low = ln.lower()
+        if any(p in low for p in _FFMPEG_ERROR_PATTERNS):
+            if ln not in err_lines:
+                err_lines.append(ln[:300])
+        if len(err_lines) >= 10:
+            break
+    tail = err_text.strip()[-1500:]
+    parts = [f"ffmpeg が失敗しました (終了コード {returncode})"]
+    if returncode == -9:
+        parts.append("SIGKILL で終了しました"
+                     "（メモリ不足で OS に kill された可能性が高いです）")
+    elif returncode is not None and returncode < 0:
+        parts.append(f"シグナル {-returncode} で終了しました")
+    if err_lines:
+        parts.append("エラー行:\n" + "\n".join(err_lines))
+    parts.append("出力の末尾:\n" + tail)
+    return "\n".join(parts)
+
+
 def _run_ffmpeg(cmd, expected, progress_cb=None, base_pct=0, span_pct=100):
     """ffmpeg を進捗コールバック付きで実行する"""
     cmd = cmd[:-1] + ["-progress", "pipe:1", "-nostats", cmd[-1]]
@@ -116,8 +152,9 @@ def _run_ffmpeg(cmd, expected, progress_cb=None, base_pct=0, span_pct=100):
     def drain_err():
         for ln in proc.stderr:
             err_lines.append(ln)
-            if len(err_lines) > 80:
-                del err_lines[:40]
+            # エラー行が末尾から押し出されないよう多めに保持する
+            if len(err_lines) > 400:
+                del err_lines[:200]
 
     import threading
     t = threading.Thread(target=drain_err, daemon=True)
@@ -137,9 +174,9 @@ def _run_ffmpeg(cmd, expected, progress_cb=None, base_pct=0, span_pct=100):
     proc.wait()
     t.join(timeout=2)
     if proc.returncode != 0:
-        tail = "".join(err_lines)[-1500:]
-        print(tail, file=sys.stderr)
-        raise RuntimeError(f"ffmpeg が失敗しました: {tail.strip()[-300:]}")
+        err_text = "".join(err_lines)
+        print(err_text.strip()[-1500:], file=sys.stderr)
+        raise RuntimeError(_ffmpeg_error_summary(err_text, proc.returncode))
 
 
 # ---------------------------------------------------------------------------
@@ -334,34 +371,209 @@ def _join_plan(keeps, dissolve, fps):
     return joins, acc
 
 
+def _scale_chain(width, height, fps):
+    return (f"scale={width}:{height}:force_original_aspect_ratio=disable,"
+            f"setsar=1,fps={fps},format=yuv420p")
+
+
+def _render_chain(input_video, segments, ds, width, height, fps, out_path,
+                  crf, preset, progress_cb, expected, base_pct=0, span_pct=100,
+                  seek=0.0, pcm_audio=False):
+    """入力 [0] の複数区間をディゾルブ (ds: つなぎ目ごとの秒数) でつないで
+    out_path に書く単一グラフ方式。ds が空なら concat でつなぐ。
+    xfade の全入力に settb=AVTB を入れ、ffmpeg のバージョン差による
+    タイムベース不一致を防ぐ。
+    seek > 0 のときは入力シーク (-ss を -i の前に付ける) し、segments は
+    シーク後の時刻 (元の時刻 - seek) で渡すこと。長尺動画の後半の区間を
+    頭からデコードし直さずに切り出すために使う。
+    注意: この方式は区間のフレームをグラフ内に溜めるため、メモリ使用量が
+    区間数と長さに比例する。大きな plan では _build_main_cut_smart を使う。"""
+    scale = _scale_chain(width, height, fps)
+    afmt = "aresample=48000,aformat=channel_layouts=stereo"
+    if pcm_audio:
+        afmt += ":sample_fmts=s16"
+    filters = []
+    for i, (a, b) in enumerate(segments):
+        filters.append(f"[0:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{scale},settb=AVTB[v{i}]")
+        filters.append(f"[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,{afmt}[a{i}]")
+    if not ds:
+        labels = "".join(f"[v{i}][a{i}]" for i in range(len(segments)))
+        filters.append(labels + f"concat=n={len(segments)}:v=1:a=1[v][a]")
+    else:
+        # xfade の offset は _join_plan と同じ蓄積計算
+        offsets = []
+        acc = segments[0][1] - segments[0][0]
+        for k in range(1, len(segments)):
+            offsets.append(acc - ds[k - 1])
+            acc = acc + (segments[k][1] - segments[k][0]) - ds[k - 1]
+        cur_v, cur_a = "v0", "a0"
+        for k in range(1, len(segments)):
+            d, off = ds[k - 1], offsets[k - 1]
+            filters.append(f"[{cur_v}][v{k}]xfade=transition=fade:duration={d:.3f}:offset={off:.3f}[vx{k}]")
+            filters.append(f"[vx{k}]settb=AVTB[vxs{k}]")
+            filters.append(f"[{cur_a}][a{k}]acrossfade=d={d:.3f}[ax{k}]")
+            cur_v, cur_a = f"vxs{k}", f"ax{k}"
+        filters.append(f"[{cur_v}]null[v]")
+        filters.append(f"[{cur_a}]anull[a]")
+    cmd = ["ffmpeg", "-y"]
+    if seek > 0:
+        cmd += ["-ss", f"{seek:.3f}"]
+    cmd += ["-i", str(input_video),
+            "-filter_complex", ";".join(filters),
+            "-map", "[v]", "-map", "[a]",
+            "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p"]
+    if pcm_audio:
+        cmd += ["-c:a", "pcm_s16le"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", "192k"]
+    cmd += [str(out_path)]
+    _run_ffmpeg(cmd, expected, progress_cb, base_pct=base_pct, span_pct=span_pct)
+
+
+# 単一グラフ方式 (全区間を1つの ffmpeg で xfade 接続) が安全な上限。
+# これを超えると、後ろの区間のフレームが xfade のキューに溜まり続け、
+# メモリを使い切って ffmpeg が OS に kill される (実測: 1920x1080・
+# 保持区間50個・本編 約76分で発生。1パス・2パスとも同じ死に方をした)。
+_CHAIN_MAX_SEGMENTS = 8
+_CHAIN_MAX_SECONDS = 20.0
+
+
+def _needs_smart_render(keeps):
+    """保持区間が多く/長い plan か (単一グラフ方式がメモリで死ぬ規模か)。"""
+    total = sum(b - a for a, b in keeps)
+    return len(keeps) > _CHAIN_MAX_SEGMENTS or total > _CHAIN_MAX_SECONDS
+
+
+def _build_main_cut_smart(input_video, keeps, joins, width, height, fps,
+                          out_path, crf, preset, progress_cb, main_dur):
+    """保持区間が多い場合の本編カット (メモリ安全な分割方式)。
+
+    本編を「ボディ断片 (各区間から前後のトランジション分を除いた中身)」
+    と「トランジション断片 (前区間の尻 d 秒 + 次区間の頭 d 秒を xfade
+    した長さ d 秒のクリップ)」に分解し、各断片を個別の ffmpeg で書き
+    出してから、concat デコーダで連結する (映像は stream copy、音声は
+    再エンコード)。各グラフが扱うのは短い区間だけなので、区間が何十個・
+    本編が何十分あってもメモリは断片サイズで有界になる。ボディ断片が
+    短すぎる区間は、前後の区間とまとめて小さなチェーン (グループ) と
+    して書き出す。
+
+    断片の音声は PCM で書き出す。AAC で断片を書いて stream copy 連結
+    すると、断片ごとのエンコード遅延 (プライミング) と末尾パディング
+    (実測 約31ms/断片) が edit list ごと捨てられて実サンプルとして
+    漏れ出し、音声だけが断片数に比例して長く (映像より遅く) なるため。
+    PCM ならサンプル数が正確に一致し、連結時の再エンコードは1回で済む。
+    """
+    import shutil
+    import tempfile
+
+    n = len(keeps)
+    lens = [b - a for a, b in keeps]
+    # dbefore[k] = 区間 k の手前のつなぎ目のディゾルブ秒 (区間0は 0)
+    dbefore = [0.0] + [d for d, _ in joins]
+    min_body = max(0.12, 3.0 / max(fps, 1))
+
+    # --- 区間をグループ化する ---
+    # 既定は1区間=1グループ。ボディ (前後のトランジションを除いた長さ)
+    # が短すぎる区間は直前のグループに寄せ、チェーンとして書き出す。
+    groups = []
+    for k in range(n):
+        body_len = lens[k] - dbefore[k] - (dbefore[k + 1] if k < n - 1 else 0.0)
+        if groups and body_len < min_body:
+            groups[-1].append(k)
+        else:
+            groups.append([k])
+    # 先頭グループが単独で短すぎる場合は次のグループと合体させる
+    while len(groups) > 1:
+        g = groups[0]
+        out_len = (sum(lens[k] for k in g) - dbefore[g[0]]
+                   - (dbefore[g[-1] + 1] if g[-1] < n - 1 else 0.0)
+                   - sum(dbefore[k] for k in g[1:]))
+        if out_len >= min_body:
+            break
+        groups[0] = g + groups.pop(1)
+
+    # --- 描画ユニット列 (グループ本体 / グループ間のトランジション) ---
+    units = []  # ("group", [seg...]) | ("trans", k)  k は次区間の index
+    for gi, g in enumerate(groups):
+        if gi > 0:
+            units.append(("trans", g[0]))
+        units.append(("group", g))
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="maincut_", dir=str(out_path.parent)))
+    try:
+        atom_files = []
+        done_span = 0.0
+        total_span = max(main_dur, 0.1)
+
+        def span_of(u):
+            if u[0] == "trans":
+                return dbefore[u[1]]
+            g = u[1]
+            return (sum(lens[k] for k in g) - dbefore[g[0]]
+                    - (dbefore[g[-1] + 1] if g[-1] < n - 1 else 0.0)
+                    - sum(dbefore[k] for k in g[1:]))
+
+        for ui, u in enumerate(units):
+            atom = tmpdir / f"atom_{ui:04d}.mkv"
+            span = span_of(u)
+            base = 30.0 * done_span / total_span
+            pct_span = 30.0 * span / total_span
+            if u[0] == "trans":
+                k = u[1]
+                d = dbefore[k]
+                pa, pb = keeps[k - 1], keeps[k]
+                segments = [(pa[1] - d, pa[1]), (pb[0], pb[0] + d)]
+                ds = [d]
+            else:
+                g = u[1]
+                segments = []
+                for pos, k in enumerate(g):
+                    a, b = keeps[k]
+                    if pos == 0 and k > 0:
+                        a = a + dbefore[k]
+                    if pos == len(g) - 1 and k < n - 1:
+                        b = b - dbefore[k + 1]
+                    segments.append((a, b))
+                ds = [dbefore[k] for k in g[1:]]
+            # 断片の開始位置まで入力シークし、頭からのデコードし直しを避ける
+            seek = max(0.0, min(a for a, _ in segments) - 0.5)
+            if seek > 0:
+                segments = [(a - seek, b - seek) for a, b in segments]
+            _render_chain(input_video, segments, ds, width, height, fps,
+                          atom, crf, preset, progress_cb, span,
+                          base_pct=base, span_pct=pct_span, seek=seek,
+                          pcm_audio=True)
+            atom_files.append(atom)
+            done_span += span
+
+        # --- concat デコーダで連結 (映像 copy / 音声は AAC に再エンコード) ---
+        list_path = tmpdir / "concat.txt"
+        with open(list_path, "w", encoding="utf-8") as f:
+            for atom in atom_files:
+                f.write(f"file '{str(atom).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out_path)]
+        _run_ffmpeg(cmd, main_dur, progress_cb, base_pct=30.0 * done_span / total_span,
+                    span_pct=30.0 - 30.0 * done_span / total_span)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _build_main_cut(input_video, keeps, width, height, fps, out_path,
                     crf, preset, progress_cb, main_dur, dissolve=0.0):
     """無音を除いた本編だけの中間ファイルを作る (従来方式・フォールバック用)。
-    つなぎ目にはディゾルブ (xfade/acrossfade) をかける。"""
-    scale = f"scale={width}:{height}:force_original_aspect_ratio=disable,setsar=1,fps={fps},format=yuv420p"
-    filters = []
-    for i, (a, b) in enumerate(keeps):
-        filters.append(f"[0:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{scale}[v{i}]")
-        filters.append(f"[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a{i}]")
+    つなぎ目にはディゾルブ (xfade/acrossfade) をかける。
+    保持区間が多い場合はメモリ安全な分割方式 (_build_main_cut_smart)。"""
     joins, _ = _join_plan(keeps, dissolve, fps)
-    if not joins:
-        labels = "".join(f"[v{i}][a{i}]" for i in range(len(keeps)))
-        filters.append(labels + f"concat=n={len(keeps)}:v=1:a=1[v][a]")
-    else:
-        cur_v, cur_a = "v0", "a0"
-        for k in range(1, len(keeps)):
-            d, off = joins[k - 1]
-            filters.append(f"[{cur_v}][v{k}]xfade=transition=fade:duration={d:.3f}:offset={off:.3f}[vx{k}]")
-            filters.append(f"[{cur_a}][a{k}]acrossfade=d={d:.3f}[ax{k}]")
-            cur_v, cur_a = f"vx{k}", f"ax{k}"
-        filters.append(f"[{cur_v}]null[v]")
-        filters.append(f"[{cur_a}]anull[a]")
-    cmd = ["ffmpeg", "-y", "-i", str(input_video),
-           "-filter_complex", ";".join(filters),
-           "-map", "[v]", "-map", "[a]",
-           "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
-           "-c:a", "aac", "-b:a", "192k", str(out_path)]
-    _run_ffmpeg(cmd, main_dur, progress_cb, base_pct=0, span_pct=30)
+    if joins and _needs_smart_render(keeps):
+        _progress(f"保持区間が {len(keeps)} 個あるため、メモリ安全な分割方式で本編を作ります")
+        _build_main_cut_smart(input_video, keeps, joins, width, height, fps,
+                              out_path, crf, preset, progress_cb, main_dur)
+        return
+    ds = [d for d, _ in joins]
+    _render_chain(input_video, [tuple(k) for k in keeps], ds, width, height, fps,
+                  out_path, crf, preset, progress_cb, main_dur,
+                  base_pct=0, span_pct=30)
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +753,9 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None,
                 sys.path.insert(0, str(Path(__file__).parent))
                 import llm_detect
                 _progress("AI検出を行います…")
-                found = llm_detect.detect_ranges(cues, llm_client)
+                llm_stats = {}
+                found = llm_detect.detect_ranges(cues, llm_client,
+                                                 stats=llm_stats)
                 for cand in found:
                     cs = max(cand["start"], trim_start)
                     ce = min(cand["end"], end)
@@ -550,7 +764,16 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None,
                                         "end": round(ce, 3)})
                 llm_status = {"status": "ok", "count": len(found),
                               "client": getattr(llm_client, "name", "unknown")}
-                _progress(f"AI検出が終わりました（候補 {len(found)} 件）")
+                if llm_stats.get("partial"):
+                    # 一部の窓だけ失敗した場合は、その旨を detail に残す
+                    llm_status["detail"] = (
+                        f"{llm_stats['windows_total']}窓中"
+                        f"{llm_stats['windows_ok']}窓成功"
+                        f"（{llm_stats['windows_failed']}窓は失敗したため未検出）")
+                    _progress(f"AI検出が終わりました（候補 {len(found)} 件、"
+                              f"{llm_status['detail']}）")
+                else:
+                    _progress(f"AI検出が終わりました（候補 {len(found)} 件）")
             except Exception as e:  # noqa: BLE001 - 検出失敗でも plan は作る
                 _progress(f"AI検出は失敗しました（plan はそのまま続けます）: "
                           f"{str(e)[:120]}")
@@ -685,20 +908,22 @@ def _render_one_pass(plan, thumb, output, cfg, enc_args, progress_cb):
     # ことがあり不一致で失敗するため、xfade の全入力を settb=AVTB で統一する。
     filters.append(f"[0:v]{scale},trim=duration={intro},setpts=PTS-STARTPTS,settb=AVTB[v0]")
     for i, (a, b) in enumerate(keeps):
-        filters.append(f"[1:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{scale}[vk{i}]")
+        filters.append(f"[1:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{scale},settb=AVTB[vk{i}]")
     if joins:
         cur = "vk0"
         for k in range(1, len(keeps)):
             d, off = joins[k - 1]
             filters.append(f"[{cur}][vk{k}]xfade=transition=fade:duration={d:.3f}:offset={off:.3f}[vx{k}]")
-            cur = f"vx{k}"
+            filters.append(f"[vx{k}]settb=AVTB[vxs{k}]")
+            cur = f"vxs{k}"
         filters.append(f"[{cur}]settb=AVTB[vmain]")
     else:
         labels = "".join(f"[vk{i}]" for i in range(len(keeps)))
         filters.append(labels + f"concat=n={len(keeps)}:v=1:a=0,settb=AVTB[vmain]")
     filters.append(f"[2:v]{scale},trim=duration={outro},setpts=PTS-STARTPTS,settb=AVTB[v2]")
     filters.append(f"[v0][vmain]xfade=transition=fade:duration={dissolve}:offset={offset1}[vx]")
-    filters.append(f"[vx][v2]xfade=transition=fade:duration={dissolve}:offset={offset2}[vout]")
+    filters.append(f"[vx]settb=AVTB[vxs]")
+    filters.append(f"[vxs][v2]xfade=transition=fade:duration={dissolve}:offset={offset2}[vout]")
 
     # --- 音声 ---
     if asset_has_audio:
@@ -774,11 +999,12 @@ def _final_pass(main_input, main_start, main_end, thumb, asset_type, asset_info,
     scale = f"scale={width}:{height}:force_original_aspect_ratio=disable,setsar=1,fps={fps},format=yuv420p"
 
     filters = []
-    filters.append(f"[0:v]{scale},trim=duration={intro},setpts=PTS-STARTPTS[v0]")
-    filters.append(f"[1:v]trim=start={main_start}:end={main_end},setpts=PTS-STARTPTS,{scale}[v1]")
-    filters.append(f"[2:v]{scale},trim=duration={outro},setpts=PTS-STARTPTS[v2]")
+    filters.append(f"[0:v]{scale},trim=duration={intro},setpts=PTS-STARTPTS,settb=AVTB[v0]")
+    filters.append(f"[1:v]trim=start={main_start}:end={main_end},setpts=PTS-STARTPTS,{scale},settb=AVTB[v1]")
+    filters.append(f"[2:v]{scale},trim=duration={outro},setpts=PTS-STARTPTS,settb=AVTB[v2]")
     filters.append(f"[v0][v1]xfade=transition=fade:duration={dissolve}:offset={offset1}[vx]")
-    filters.append(f"[vx][v2]xfade=transition=fade:duration={dissolve}:offset={offset2}[vout]")
+    filters.append(f"[vx]settb=AVTB[vxs]")
+    filters.append(f"[vxs][v2]xfade=transition=fade:duration={dissolve}:offset={offset2}[vout]")
 
     if asset_has_audio:
         filters.append(f"[0:a]atrim=duration={intro},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[a0]")
@@ -891,11 +1117,18 @@ def render_plan(plan: dict, output: Path, cfg: dict = None, thumb=None, progress
     enc_args, enc_name = _encoder_args(eff)
     print(f"  エンコーダ: {enc_name}")
     if eff.get("one_pass", True):
-        try:
-            _render_one_pass(plan, thumb, output, eff, enc_args, progress_cb)
-            return
-        except RuntimeError as e:
-            print(f"  1パス書き出しに失敗したため従来方式 (2パス) にフォールバックします: {e}")
+        keeps = [tuple(k) for k in (plan.get("silence") or {}).get("keeps") or []]
+        if keeps and _needs_smart_render(keeps):
+            # 1パス方式は全区間を1グラフでつなぐため、区間が多いと
+            # メモリを使い切って ffmpeg が kill される。最初から
+            # メモリ安全な従来方式 (分割方式の本編カット + 最終パス) を使う。
+            print("  保持区間が多いため、メモリ安全な従来方式 (2パス) で書き出します")
+        else:
+            try:
+                _render_one_pass(plan, thumb, output, eff, enc_args, progress_cb)
+                return
+            except RuntimeError as e:
+                print(f"  1パス書き出しに失敗したため従来方式 (2パス) にフォールバックします: {e}")
     _render_legacy(plan, thumb, output, eff, enc_args, progress_cb)
 
 
