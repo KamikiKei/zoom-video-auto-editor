@@ -92,6 +92,20 @@ def parse_time(v) -> float:
     return sum(float(p) * 60 ** i for i, p in enumerate(reversed(parts)))
 
 
+def _mmss(sec) -> str:
+    """秒を m:ss 表記にする (進捗・要約表示用)"""
+    sec = int(round(float(sec)))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def _progress(msg: str):
+    """処理の途中経過を標準出力に1行ずつ出す。
+    長い処理でも「止まって見える」ことがないよう、各段階で呼ぶ。
+    呼び出し側 (Colab ノートブック等) がリアルタイムに表示できるよう
+    必ず flush する。"""
+    print(msg, flush=True)
+
+
 def _run_ffmpeg(cmd, expected, progress_cb=None, base_pct=0, span_pct=100):
     """ffmpeg を進捗コールバック付きで実行する"""
     cmd = cmd[:-1] + ["-progress", "pipe:1", "-nostats", cmd[-1]]
@@ -406,15 +420,19 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None,
     if fps <= 0 or fps > 120:
         fps = 30.0
     total = float(info["format"]["duration"])
+    _progress(f"動画情報を取得しました（{_mmss(total)}）")
 
     # --- 話者・登壇者推定 (Zoom文字起こしがある場合) ---
     speakers = None
     cues = []
     if transcript_path:
+        _progress("文字起こしを解析しています…")
         sys.path.insert(0, str(Path(__file__).parent))
         from transcript import build_result, parse_transcript
         cues = parse_transcript(Path(transcript_path))
         speakers = build_result(cues)
+        _progress(f"文字起こしを解析しました（キュー {len(cues)} 件、"
+                  f"話者 {len(speakers.get('names') or {})} 人）")
 
     # --- 登壇者 (複数可) ---
     # cfg["presenters"] で話者インデックスを複数指定できる。未指定なら
@@ -457,6 +475,7 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None,
     if end - trim_start <= 0:
         raise ValueError(
             f"本編が0秒以下です (total={total:.1f}s, start={trim_start}, end={end})")
+    _progress(f"開始点 {_mmss(trim_start)} / 終了点 {_mmss(end)} を決めました")
 
     # --- カット候補 (無音 / 保持ポリシー / LLM検出 / ユーザー) ---
     # 検出された区間はすべて candidates として plan に残し、
@@ -492,21 +511,27 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None,
 
     # 無音カット
     if sil_enabled:
+        _progress("無音を検出しています…")
         _all_keeps, cuts_all = _keep_segments(
             detect_silences(input_video, min_sec, db), trim_start, end, min_sec)
         for c in cuts_all:
             _add_candidate({"start": round(c[0], 3), "end": round(c[1], 3),
                             "kind": "silence", "source": "silence"})
+        _progress(f"無音検出が終わりました（カット候補 {len(cuts_all)} 件）")
 
     # デフォルト保持ポリシー: 登壇者以外の発話を最初からカット候補にする。
     # cfg["keep_presenters_only"] = False で無効化できる。
     keep_presenters_only = bool(cfg.get("keep_presenters_only", True))
     policy_applied = False
     if keep_presenters_only and speakers and presenters:
+        n_policy = 0
         for cand in _policy_candidates(speakers, cues, presenters,
                                        trim_start, end):
             _add_candidate(cand)
             policy_applied = True
+            n_policy += 1
+        if n_policy:
+            _progress(f"登壇者以外の発話をカット候補にしました（{n_policy} 件）")
 
     # LLM検出 (transcript のもたつき・トラブル・本題外)
     llm_status = {"status": "skipped", "detail": "LLMクライアント未指定"}
@@ -515,6 +540,7 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None,
             try:
                 sys.path.insert(0, str(Path(__file__).parent))
                 import llm_detect
+                _progress("AI検出を行います…")
                 found = llm_detect.detect_ranges(cues, llm_client)
                 for cand in found:
                     cs = max(cand["start"], trim_start)
@@ -524,7 +550,10 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None,
                                         "end": round(ce, 3)})
                 llm_status = {"status": "ok", "count": len(found),
                               "client": getattr(llm_client, "name", "unknown")}
+                _progress(f"AI検出が終わりました（候補 {len(found)} 件）")
             except Exception as e:  # noqa: BLE001 - 検出失敗でも plan は作る
+                _progress(f"AI検出は失敗しました（plan はそのまま続けます）: "
+                          f"{str(e)[:120]}")
                 llm_status = {"status": "failed", "detail": str(e)[:200]}
         else:
             llm_status = {"status": "skipped", "detail": "transcript がありません"}
@@ -582,6 +611,8 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None,
     _, main_len = _join_plan(keeps, dissolve, fps)
     expected = intro + main_len + outro - 2 * dissolve
 
+    _progress(f"カット案ができました（保持区間 {len(keeps)} 個、"
+              f"想定の出力尺 {_mmss(expected)}）")
     return {
         "version": 1,
         "video": {
@@ -1006,8 +1037,18 @@ def _render_cli(argv):
     else:
         v = Path(plan["video"]["path"])
         output = v.with_name(v.stem + "_edited.mp4")
+
+    _pct_state = {"last": -10}
+
+    def _render_progress(pct):
+        # エンコード中も無言にならないよう、10% 刻みで進捗を出す
+        if pct >= 100 or pct - _pct_state["last"] >= 10:
+            _pct_state["last"] = pct
+            print(f"  書き出し中… {pct}%", flush=True)
+
     render_plan(plan, output, cfg=cfg,
-                thumb=Path(args.thumb) if args.thumb else None)
+                thumb=Path(args.thumb) if args.thumb else None,
+                progress_cb=_render_progress)
 
 
 def main():

@@ -88,7 +88,7 @@ class GeminiClient:
 
     name = "gemini"
 
-    def __init__(self, api_key=None, model=None, timeout=180):
+    def __init__(self, api_key=None, model=None, timeout=120):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY") \
             or os.environ.get("GOOGLE_API_KEY")
         if not self.api_key:
@@ -302,7 +302,13 @@ def detect_ranges(cues, client, window_sec: float = 600.0,
     indexed = [dict(c, index=i) for i, c in enumerate(cues)]
     by_index = {c["index"]: c for c in indexed}
     found = []
-    for a, b in _windows(indexed, window_sec, overlap_sec):
+    wins = _windows(indexed, window_sec, overlap_sec)
+    for wi, (a, b) in enumerate(wins, 1):
+        # 窓ごとに進捗を出す (長い動画では窓が10個前後になり、
+        # 無言だと「止まった」ように見えるため)
+        print(f"AI検出: 窓 {wi}/{len(wins)} を問い合わせ中…", flush=True)
         items = client.detect_window(indexed[a:b])
         found.extend(_validate_items(items, by_index))
-    return _merge(found)
+    merged = _merge(found)
+    print(f"AI検出: 完了しました（候補 {len(merged)} 件）", flush=True)
+    return merged
