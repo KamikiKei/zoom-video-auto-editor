@@ -29,7 +29,7 @@
   ZOOM_CLIENT_ID   あれば Zoom 実接続 (未実装スタブ)
   YOUTUBE_CLIENT_SECRETS あれば YouTube 実接続 (未実装スタブ)
   GEMINI_API_KEY / GOOGLE_API_KEY あれば LLM検出 (もたつき・トラブル) が有効
-  GEMINI_MODEL     LLM検出のモデル (既定 gemini-2.5-flash)
+  GEMINI_MODEL     LLM検出のモデル (既定 gemini-3-flash-preview)
   LLM_DETECT       "mock" でモック検出、"off" でLLM検出を無効化
 """
 import argparse

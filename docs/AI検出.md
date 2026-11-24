@@ -49,7 +49,10 @@ Zoom の文字起こし (VTT) をもとに、「最初からカット候補に�
   プロバイダ差し替え可能な抽象（`detect_window(cues)`）の上に載せてあり、
   代替として Anthropic Claude Messages API 向けクライアントも同じ抽象で
   実装可能（未実装）。
-- モデル: 既定 `gemini-2.5-flash`、環境変数 `GEMINI_MODEL` で差し替え可能。
+- モデル: 既定 `gemini-3-flash-preview`、環境変数 `GEMINI_MODEL` で差し替え可能。
+  （当初は `gemini-2.5-flash` を既定にしていたが、発行済みキーに対して
+  HTTP 404（新規ユーザー向け提供終了）を返すことが実キー検証で判明したため、
+  2026-11-24 に既定を `gemini-3-flash-preview` へ変更した。）
 - JSON 出力の強制: Gemini の structured output
   （`responseMimeType: "application/json"` + `responseSchema`）を使う。
   応答スキーマは `{start_cue, end_cue, kind, reason, confidence}` の配列。
@@ -59,7 +62,7 @@ Zoom の文字起こし (VTT) をもとに、「最初からカット候補に�
 | 変数 | 意味 |
 |---|---|
 | `GEMINI_API_KEY`（または `GOOGLE_API_KEY`） | Gemini API キー。無ければ LLM 検出はスキップ |
-| `GEMINI_MODEL` | モデル ID（既定 `gemini-2.5-flash`） |
+| `GEMINI_MODEL` | モデル ID（既定 `gemini-3-flash-preview`） |
 | `LLM_DETECT` | `mock` = モック検出を強制 / `off` = LLM 検出を無効化 |
 
 ### プロンプト設計
@@ -126,7 +129,8 @@ Zoom の文字起こし (VTT) をもとに、「最初からカット候補に�
 
 ## 未実施・TODO
 
-- **実キーでの動作確認は未実施**（Gemini API キーは発行手続き中）。
-  テストはモッククライアントとフェイク HTTP で全て回している。
+- 実キーでの動作確認は 2026-11-24 に Colab で実施済み
+  （`gemini-3-flash-preview` で AI検出 status ok を確認）。
+  通常のテストはモッククライアントとフェイク HTTP で回している。
 - 画面共有中の音声の自動除外（設計メモ参照）は未実装のまま。
 - 終了点の候補提案は未実装（開始点のみ）。

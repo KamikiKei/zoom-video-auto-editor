@@ -19,7 +19,7 @@ LLM API で検出するモジュール。
 
 環境変数:
   GEMINI_API_KEY / GOOGLE_API_KEY : Gemini API キー
-  GEMINI_MODEL                    : モデルID (既定 gemini-2.5-flash)
+  GEMINI_MODEL                    : モデルID (既定 gemini-3-flash-preview)
   LLM_DETECT                      : "mock" でモック強制、"off" で無効化
 
 依存は Python 標準ライブラリのみ (urllib)。
@@ -30,7 +30,7 @@ import re
 import urllib.request
 
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3-flash-preview"
 KINDS = ("trouble", "fumbling", "offtopic")
 
 SYSTEM_PROMPT = """あなたはオンラインセミナーの動画編集を支援するAIです。
