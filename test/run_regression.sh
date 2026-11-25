@@ -302,6 +302,50 @@ $E plain.mp4 assetN_diff.mp4 -o outN2.mp4 --config cfgC.json > n2.log 2>&1
 grep -q "1パス" n2.log || { echo "FAIL N: 1パスで書けていない"; cat n2.log; exit 1; }
 check "$(dur outN2.mp4)" 11.0 "N 1pass (diff fps/size asset)"
 
+echo "== Case O: 統合分割方式 + 画像素材 (保持区間が多い plan) =="
+# 回帰防止: 保持区間が多い plan では、OP/ED 接続も断片方式に統合され、
+# 本編全体を通す再エンコードが走らないこと。画像素材 (静止画ループ入力)
+# が断片・つなぎ目断片の両方で扱えることもここで確認する。
+$E plan --video big.mp4 --thumb "$OLDPWD/$THUMB" --silence-cut --silence-sec 0.9 \
+  --intro-sec 2 --outro-sec 2 --dissolve 0.5 --out planO.json > planO.log
+python3 - <<'PY'
+import json
+p = json.load(open("planO.json"))
+assert len(p["silence"]["keeps"]) >= 40
+open("expectedO.txt", "w").write(str(p["expected_duration"]))
+print(f"OK   O plan (expected={p['expected_duration']})")
+PY
+$E render --plan planO.json -o outO.mp4 > renderO.log 2>&1
+grep -q "統合分割方式" renderO.log || { echo "FAIL O: 統合方式が使われていない"; cat renderO.log; exit 1; }
+checktol "$(dur outO.mp4)" "$(cat expectedO.txt)" "O render (image asset, unified)" 0.6
+
+echo "== Case P: 作業ディレクトリ + 入力のローカル化 =="
+# 中間ファイルは EDIT_WORKDIR の下に作られ、別FS (例: /dev/shm や
+# Google Drive FUSE) の入力はレンダー開始時に作業領域へ寄せられる。
+mkdir -p wdtest
+EDIT_WORKDIR="$WORK/wdtest" $E render --plan planB.json -o outP.mp4 > renderP.log 2>&1
+check "$(dur outP.mp4)" 17.5 "P render (EDIT_WORKDIR)"
+if [ -d /dev/shm ]; then
+  cp sil.mp4 /dev/shm/loc_src_test.mp4
+  python3 - <<'PY'
+import json, os
+from pathlib import Path
+if os.stat("/dev/shm").st_dev == os.stat("/tmp").st_dev:
+    print("SKIP P localize (same fs)")
+else:
+    p = json.load(open("planB.json"))
+    p["video"]["path"] = "/dev/shm/loc_src_test.mp4"
+    json.dump(p, open("planP.json", "w"), ensure_ascii=False)
+    print("OK   P localize plan ready")
+PY
+  if [ -f planP.json ]; then
+    EDIT_WORKDIR="$WORK/wdtest" $E render --plan planP.json -o outP2.mp4 > renderP2.log 2>&1
+    grep -q "コピーしています" renderP2.log || { echo "FAIL P: 入力コピーが走っていない"; cat renderP2.log; exit 1; }
+    check "$(dur outP2.mp4)" 17.5 "P render (localized input)"
+  fi
+  rm -f /dev/shm/loc_src_test.mp4
+fi
+
 echo "== AI検出・ポリシーの単体テスト (モック/フェイクHTTP) =="
 python3 "$OLDPWD/test/test_ai_detect.py" > ai_detect.log 2>&1 \
   && echo "OK   test_ai_detect.py" || { cat ai_detect.log; exit 1; }

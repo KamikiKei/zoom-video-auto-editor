@@ -39,14 +39,40 @@ OP/EDの切り方:
 
 書き出し方式:
   既定は1パス (無音カットの保持区間も含め単一フィルタグラフで1回だけ
-  エンコード)。失敗した場合は従来の中間ファイル方式 (2パス) に自動で
+  エンコード)。保持区間が多い場合はメモリ安全な統合分割方式 (下記) を
+  使い、失敗した場合は従来の中間ファイル方式 (2パス) に自動で
   フォールバックする。cfg "one_pass": false で従来方式を強制できる。
+
+  統合分割方式: render 全体 (OP + 本編の保持区間 + ED) を1つの断片計画
+  として組み立て、「本体断片 + つなぎ目断片」を個別にエンコードして
+  concat で連結する。本編全体を通す再エンコードは走らない (従来方式の
+  最終パスは本編を丸ごと再エンコードしていた)。断片の音声は PCM で
+  書き、AAC プライミングによる音声ズレを防ぐ (ddcf66b の対策を継承)。
+
+作業ファイル:
+  中間ファイル (断片・本編カット) は作業ディレクトリに置く。場所は
+  cfg "workdir" > 環境変数 EDIT_WORKDIR > システムの一時領域 の順
+  (一時領域の空きが断片の必要量に足りない場合は出力先のフォルダへ
+  フォールバックする。小さな tmpfs の /tmp 等での容量不足を避けるため)。
+  入力 (元動画・素材) が作業ディレクトリと別ファイルシステム (Google
+  Drive の FUSE 等) にある場合は、レンダー開始時に作業ディレクトリへ
+  1回だけコピーしてから処理する (断片ごとの低速なリモートアクセスを
+  避けるため)。完成品だけを指定の出力パスへ書く。
+
+NVDEC:
+  cfg "hwaccel": "cuda" で、NVENC 使用時に入力デコードへ -hwaccel cuda
+  を付ける (既定は無効)。全フレームが CPU フィルタ (trim/scale/xfade)
+  を通る構成のため、フレーム転送コストで逆効果になりやすく、実測で
+  速くなる環境でのみ有効化すること。
 """
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -376,36 +402,47 @@ def _scale_chain(width, height, fps):
             f"setsar=1,fps={fps},format=yuv420p")
 
 
-def _render_chain(input_video, segments, ds, width, height, fps, out_path,
-                  crf, preset, progress_cb, expected, base_pct=0, span_pct=100,
-                  seek=0.0, pcm_audio=False):
-    """入力 [0] の複数区間をディゾルブ (ds: つなぎ目ごとの秒数) でつないで
+def _render_chain2(inputs, segments, ds, width, height, fps, out_path,
+                   venc, progress_cb, expected, base_pct=0, span_pct=100,
+                   pcm_audio=False):
+    """複数入力の区間列をディゾルブ (ds: つなぎ目ごとの秒数) でつないで
     out_path に書く単一グラフ方式。ds が空なら concat でつなぐ。
     xfade の全入力に settb=AVTB を入れ、ffmpeg のバージョン差による
     タイムベース不一致を防ぐ。
-    seek > 0 のときは入力シーク (-ss を -i の前に付ける) し、segments は
-    シーク後の時刻 (元の時刻 - seek) で渡すこと。長尺動画の後半の区間を
-    頭からデコードし直さずに切り出すために使う。
+
+    inputs: 入力仕様のリスト。各要素は
+      {"kind": "file",  "path": Path, "audio": bool, "seek": float,
+       "hwaccel": bool}
+      {"kind": "image", "path": Path, "audio": False}  (静止画ループ入力)
+      "seek" は入力シーク秒 (その入力の segments はシーク後の時刻で渡す)。
+      "audio" が False の区間は無音 (anullsrc) で埋める。
+    segments: (入力インデックス, 開始秒, 終了秒) のリスト。
+    venc: 映像エンコーダ引数 (例: libx264 の crf/preset や NVENC 引数)。
     注意: この方式は区間のフレームをグラフ内に溜めるため、メモリ使用量が
-    区間数と長さに比例する。大きな plan では _build_main_cut_smart を使う。"""
+    区間数と長さに比例する。大きな plan では断片方式 (_build_unified /
+    _build_main_cut_smart) を使う。"""
     scale = _scale_chain(width, height, fps)
     afmt = "aresample=48000,aformat=channel_layouts=stereo"
     if pcm_audio:
         afmt += ":sample_fmts=s16"
     filters = []
-    for i, (a, b) in enumerate(segments):
-        filters.append(f"[0:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{scale},settb=AVTB[v{i}]")
-        filters.append(f"[0:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,{afmt}[a{i}]")
+    for i, (idx, a, b) in enumerate(segments):
+        filters.append(f"[{idx}:v]trim=start={a}:end={b},setpts=PTS-STARTPTS,{scale},settb=AVTB[v{i}]")
+        if inputs[idx].get("audio"):
+            filters.append(f"[{idx}:a]atrim=start={a}:end={b},asetpts=PTS-STARTPTS,{afmt}[a{i}]")
+        else:
+            filters.append(f"anullsrc=cl=stereo:r=48000,atrim=duration={b - a:.3f},"
+                           f"asetpts=PTS-STARTPTS,{afmt}[a{i}]")
     if not ds:
         labels = "".join(f"[v{i}][a{i}]" for i in range(len(segments)))
         filters.append(labels + f"concat=n={len(segments)}:v=1:a=1[v][a]")
     else:
         # xfade の offset は _join_plan と同じ蓄積計算
         offsets = []
-        acc = segments[0][1] - segments[0][0]
+        acc = segments[0][2] - segments[0][1]
         for k in range(1, len(segments)):
             offsets.append(acc - ds[k - 1])
-            acc = acc + (segments[k][1] - segments[k][0]) - ds[k - 1]
+            acc = acc + (segments[k][2] - segments[k][1]) - ds[k - 1]
         cur_v, cur_a = "v0", "a0"
         for k in range(1, len(segments)):
             d, off = ds[k - 1], offsets[k - 1]
@@ -416,18 +453,42 @@ def _render_chain(input_video, segments, ds, width, height, fps, out_path,
         filters.append(f"[{cur_v}]null[v]")
         filters.append(f"[{cur_a}]anull[a]")
     cmd = ["ffmpeg", "-y"]
-    if seek > 0:
-        cmd += ["-ss", f"{seek:.3f}"]
-    cmd += ["-i", str(input_video),
-            "-filter_complex", ";".join(filters),
+    for ii, spec in enumerate(inputs):
+        if spec["kind"] == "image":
+            cmd += ["-loop", "1", "-framerate", str(fps)]
+            ends = [b for (i2, a, b) in segments if i2 == ii]
+            if ends:
+                cmd += ["-t", f"{max(ends) + 2.0:.3f}"]
+            cmd += ["-i", str(spec["path"])]
+        else:
+            if spec.get("hwaccel"):
+                cmd += ["-hwaccel", "cuda"]
+            if spec.get("seek", 0.0) > 0:
+                cmd += ["-ss", f"{spec['seek']:.3f}"]
+            cmd += ["-i", str(spec["path"])]
+    cmd += ["-filter_complex", ";".join(filters),
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p"]
+            *venc, "-pix_fmt", "yuv420p"]
     if pcm_audio:
         cmd += ["-c:a", "pcm_s16le"]
     else:
         cmd += ["-c:a", "aac", "-b:a", "192k"]
     cmd += [str(out_path)]
     _run_ffmpeg(cmd, expected, progress_cb, base_pct=base_pct, span_pct=span_pct)
+
+
+def _render_chain(input_video, segments, ds, width, height, fps, out_path,
+                  crf, preset, progress_cb, expected, base_pct=0, span_pct=100,
+                  seek=0.0, pcm_audio=False, hwaccel=False):
+    """単一入力版の _render_chain2 ラッパ (従来インタフェース互換)。
+    seek > 0 のときは入力シークし、segments はシーク後の時刻で渡すこと。"""
+    inputs = [{"kind": "file", "path": Path(input_video), "audio": True,
+               "seek": seek, "hwaccel": hwaccel}]
+    segs = [(0, a, b) for a, b in segments]
+    venc = ["-c:v", "libx264", "-crf", str(crf), "-preset", preset]
+    _render_chain2(inputs, segs, ds, width, height, fps, out_path, venc,
+                   progress_cb, expected, base_pct=base_pct, span_pct=span_pct,
+                   pcm_audio=pcm_audio)
 
 
 # 単一グラフ方式 (全区間を1つの ffmpeg で xfade 接続) が安全な上限。
@@ -445,7 +506,8 @@ def _needs_smart_render(keeps):
 
 
 def _build_main_cut_smart(input_video, keeps, joins, width, height, fps,
-                          out_path, crf, preset, progress_cb, main_dur):
+                          out_path, crf, preset, progress_cb, main_dur,
+                          workdir=None, hwaccel=False):
     """保持区間が多い場合の本編カット (メモリ安全な分割方式)。
 
     本編を「ボディ断片 (各区間から前後のトランジション分を除いた中身)」
@@ -462,10 +524,8 @@ def _build_main_cut_smart(input_video, keeps, joins, width, height, fps,
     (実測 約31ms/断片) が edit list ごと捨てられて実サンプルとして
     漏れ出し、音声だけが断片数に比例して長く (映像より遅く) なるため。
     PCM ならサンプル数が正確に一致し、連結時の再エンコードは1回で済む。
+    断片の一時ファイルは workdir (無指定なら out_path の親) の下に作る。
     """
-    import shutil
-    import tempfile
-
     n = len(keeps)
     lens = [b - a for a, b in keeps]
     # dbefore[k] = 区間 k の手前のつなぎ目のディゾルブ秒 (区間0は 0)
@@ -499,7 +559,9 @@ def _build_main_cut_smart(input_video, keeps, joins, width, height, fps,
             units.append(("trans", g[0]))
         units.append(("group", g))
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="maincut_", dir=str(out_path.parent)))
+    tmpdir = Path(tempfile.mkdtemp(
+        prefix="maincut_", dir=str(workdir if workdir is not None
+                                   else out_path.parent)))
     try:
         atom_files = []
         done_span = 0.0
@@ -542,7 +604,7 @@ def _build_main_cut_smart(input_video, keeps, joins, width, height, fps,
             _render_chain(input_video, segments, ds, width, height, fps,
                           atom, crf, preset, progress_cb, span,
                           base_pct=base, span_pct=pct_span, seek=seek,
-                          pcm_audio=True)
+                          pcm_audio=True, hwaccel=hwaccel)
             atom_files.append(atom)
             done_span += span
 
@@ -560,7 +622,8 @@ def _build_main_cut_smart(input_video, keeps, joins, width, height, fps,
 
 
 def _build_main_cut(input_video, keeps, width, height, fps, out_path,
-                    crf, preset, progress_cb, main_dur, dissolve=0.0):
+                    crf, preset, progress_cb, main_dur, dissolve=0.0,
+                    workdir=None, hwaccel=False):
     """無音を除いた本編だけの中間ファイルを作る (従来方式・フォールバック用)。
     つなぎ目にはディゾルブ (xfade/acrossfade) をかける。
     保持区間が多い場合はメモリ安全な分割方式 (_build_main_cut_smart)。"""
@@ -568,12 +631,182 @@ def _build_main_cut(input_video, keeps, width, height, fps, out_path,
     if joins and _needs_smart_render(keeps):
         _progress(f"保持区間が {len(keeps)} 個あるため、メモリ安全な分割方式で本編を作ります")
         _build_main_cut_smart(input_video, keeps, joins, width, height, fps,
-                              out_path, crf, preset, progress_cb, main_dur)
+                              out_path, crf, preset, progress_cb, main_dur,
+                              workdir=workdir, hwaccel=hwaccel)
         return
     ds = [d for d, _ in joins]
     _render_chain(input_video, [tuple(k) for k in keeps], ds, width, height, fps,
                   out_path, crf, preset, progress_cb, main_dur,
-                  base_pct=0, span_pct=30)
+                  base_pct=0, span_pct=30, hwaccel=hwaccel)
+
+
+def _build_unified(plan, thumb, output, cfg, enc_args, progress_cb, workdir,
+                   hwaccel=False):
+    """統合分割方式: OP + 本編の保持区間 + ED を1つの断片計画として描く。
+
+    クリップ列 (OP素材 / 保持区間 / ED素材) を「本体断片 (グループ)」
+    と「つなぎ目断片」に分解し、各断片を最終エンコーダで個別に書き
+    出して concat (映像 copy / 音声のみ AAC 化) で連結する。従来方式の
+    最終パスと違い、本編全体を通す再エンコードは走らない。メモリの
+    有界性と AAC プライミング対策 (断片音声は PCM) は _build_main_cut_smart
+    と同じ仕組み。断片は workdir の下に作り、完成品だけを output に書く。
+
+    端の保持区間がディゾルブより短い場合はつなぎ目断片を作れないため
+    RuntimeError を投げ、呼び出し側で従来方式にフォールバックさせる。
+    """
+    vinfo = plan["video"]
+    video = Path(vinfo["path"])
+    width, height, fps = vinfo["width"], vinfo["height"], vinfo["fps"]
+    has_audio = vinfo["has_audio"]
+    keeps = [tuple(k) for k in plan["silence"]["keeps"]]
+    dissolve = float(cfg.get("dissolve", 0.8))
+
+    asset_type, asset_info = _resolve_asset(thumb, cfg)
+    intro, outro, asset_has_audio = _asset_timing(asset_type, asset_info, cfg)
+    if dissolve >= intro or dissolve >= outro:
+        raise ValueError("ディゾルブ秒数がクリップ長より長いです。dissolveを短くしてください")
+
+    joins, main_len = _join_plan(keeps, dissolve, fps)
+    expected = float(plan.get("expected_duration")
+                     or (intro + main_len + outro - 2 * dissolve))
+    if dissolve > 0 and keeps and (keeps[0][1] - keeps[0][0] < dissolve
+                                   or keeps[-1][1] - keeps[-1][0] < dissolve):
+        raise RuntimeError("端の保持区間がディゾルブより短いため統合方式を使えません")
+
+    # --- クリップ列と、各クリップの「手前のつなぎ目」秒数 ---
+    clips = [{"src": "asset", "a": 0.0, "b": intro}]
+    clips += [{"src": "video", "a": a, "b": b} for a, b in keeps]
+    clips.append({"src": "asset", "a": 0.0, "b": outro})
+    m = len(clips)
+    if dissolve <= 0:
+        dbefore = [0.0] * m
+    else:
+        dbefore = [0.0, dissolve] + [d for d, _ in joins] + [dissolve]
+    lens = [c["b"] - c["a"] for c in clips]
+    min_body = max(0.12, 3.0 / max(fps, 1))
+
+    # --- グループ化 (_build_main_cut_smart と同じ方針) ---
+    # 本体 (前後のつなぎ目を除いた長さ) が短すぎるクリップは直前の
+    # グループに寄せ、小さなチェーンとして書き出す。チェーンは複数
+    # 入力対応 (_render_chain2) なので、素材と本編にまたがってもよい。
+    groups = []
+    for k in range(m):
+        body_len = lens[k] - dbefore[k] - (dbefore[k + 1] if k < m - 1 else 0.0)
+        if groups and body_len < min_body:
+            groups[-1].append(k)
+        else:
+            groups.append([k])
+    while len(groups) > 1:
+        g = groups[0]
+        out_len = (sum(lens[k] for k in g) - dbefore[g[0]]
+                   - (dbefore[g[-1] + 1] if g[-1] < m - 1 else 0.0)
+                   - sum(dbefore[k] for k in g[1:]))
+        if out_len >= min_body:
+            break
+        groups[0] = g + groups.pop(1)
+
+    units = []  # ("group", [clip...]) | ("trans", 次クリップの index)
+    for gi, g in enumerate(groups):
+        if gi > 0:
+            units.append(("trans", g[0]))
+        units.append(("group", g))
+
+    def span_of(u):
+        if u[0] == "trans":
+            return dbefore[u[1]]
+        g = u[1]
+        return (sum(lens[k] for k in g) - dbefore[g[0]]
+                - (dbefore[g[-1] + 1] if g[-1] < m - 1 else 0.0)
+                - sum(dbefore[k] for k in g[1:]))
+
+    def unit_inputs_and_segments(u):
+        """ユニット描画用の (inputs, segments, ds) を組み立てる。
+        入力ごとに入力シークを決め、segments の時刻をシーク後に直す。"""
+        if u[0] == "trans":
+            k = u[1]
+            d = dbefore[k]
+            pc, nc = clips[k - 1], clips[k]
+            raw = [(pc["src"], pc["b"] - d, pc["b"]),
+                   (nc["src"], nc["a"], nc["a"] + d)]
+            ds = [d] if d > 0 else []
+        else:
+            g = u[1]
+            raw = []
+            for pos, k in enumerate(g):
+                a, b = clips[k]["a"], clips[k]["b"]
+                if pos == 0 and k > 0:
+                    a = a + dbefore[k]
+                if pos == len(g) - 1 and k < m - 1:
+                    b = b - dbefore[k + 1]
+                raw.append((clips[k]["src"], a, b))
+            ds = [dbefore[k] for k in g[1:] if dbefore[k] > 0]
+            if len(ds) != len(g) - 1:
+                # ディゾルブ0のつなぎ目が混ざる場合は concat 扱いにできない
+                # (ds の位置対応がずれる) ため、すべて連結 (無音カット相当)
+                ds = []
+        order = []
+        for src, a, b in raw:
+            if src not in order:
+                order.append(src)
+        seeks = {}
+        for src in order:
+            if src == "video":
+                seeks[src] = max(
+                    0.0, min(a for s2, a, b in raw if s2 == src) - 0.5)
+            else:
+                seeks[src] = 0.0
+        inputs = []
+        for src in order:
+            if src == "video":
+                inputs.append({"kind": "file", "path": video,
+                               "audio": has_audio, "seek": seeks[src],
+                               "hwaccel": hwaccel})
+            elif asset_type == "video":
+                inputs.append({"kind": "file", "path": Path(thumb),
+                               "audio": asset_has_audio, "seek": 0.0})
+            else:
+                inputs.append({"kind": "image", "path": Path(thumb),
+                               "audio": False})
+        index = {src: i for i, src in enumerate(order)}
+        segments = [(index[src], a - seeks[src], b - seeks[src])
+                    for src, a, b in raw]
+        return inputs, segments, ds
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="unified_", dir=str(workdir)))
+    try:
+        atom_files = []
+        done_span = 0.0
+        total_span = max(expected, 0.1)
+        for ui, u in enumerate(units):
+            span = span_of(u)
+            if span <= 0:
+                continue  # ディゾルブ0のつなぎ目など、出力長0のユニット
+            atom = tmpdir / f"atom_{ui:04d}.mkv"
+            inputs, segments, ds = unit_inputs_and_segments(u)
+            _render_chain2(inputs, segments, ds, width, height, fps, atom,
+                           enc_args, progress_cb, span,
+                           base_pct=92.0 * done_span / total_span,
+                           span_pct=92.0 * span / total_span,
+                           pcm_audio=True)
+            atom_files.append(atom)
+            done_span += span
+        # --- concat で連結 (映像 copy / 音声は AAC に1回だけエンコード) ---
+        list_path = tmpdir / "concat.txt"
+        with open(list_path, "w", encoding="utf-8") as f:
+            for atom in atom_files:
+                f.write(f"file '{str(atom).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+               "-movflags", "+faststart", str(output)]
+        _run_ffmpeg(cmd, expected, progress_cb, base_pct=92.0, span_pct=8.0)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    final = probe(output)
+    print(f"  本編: 保持区間 {len(keeps)}個 (合計 {main_len:.1f}s) / "
+          f"intro {intro}s + outro {outro}s / dissolve {dissolve}s / "
+          f"素材={asset_type} / 統合分割方式")
+    print(f"  完了: {output} (長さ {float(final['format']['duration']):.1f}s, "
+          f"想定 {expected:.1f}s)")
 
 
 # ---------------------------------------------------------------------------
@@ -880,7 +1113,8 @@ def compute_plan(input_video: Path, cfg: dict, transcript_path=None, thumb=None,
 # ---------------------------------------------------------------------------
 # render: カット案からの書き出し
 # ---------------------------------------------------------------------------
-def _render_one_pass(plan, thumb, output, cfg, enc_args, progress_cb):
+def _render_one_pass(plan, thumb, output, cfg, enc_args, progress_cb,
+                     hwaccel=False):
     """保持区間のカット + OP/ED接続 + ディゾルブを単一フィルタグラフで行い、
     エンコード1回で書き出す。"""
     vinfo = plan["video"]
@@ -962,6 +1196,8 @@ def _render_one_pass(plan, thumb, output, cfg, enc_args, progress_cb):
         asset_in_outro = ["-loop", "1", "-framerate", str(fps), "-t", str(outro), "-i", str(thumb)]
     cmd = ["ffmpeg", "-y"]
     cmd += asset_in
+    if hwaccel:
+        cmd += ["-hwaccel", "cuda"]
     cmd += ["-i", str(video)]
     cmd += asset_in_outro
     cmd += [
@@ -985,7 +1221,7 @@ def _render_one_pass(plan, thumb, output, cfg, enc_args, progress_cb):
 
 def _final_pass(main_input, main_start, main_end, thumb, asset_type, asset_info,
                 has_audio, width, height, fps, cfg, enc_args, output,
-                progress_cb, base_pct, span_pct):
+                progress_cb, base_pct, span_pct, hwaccel=False):
     """OP/ED接続の最終パス (従来方式)。main_input は本編ファイル (中間ファイル可)。"""
     dissolve = float(cfg.get("dissolve", 0.8))
     intro, outro, asset_has_audio = _asset_timing(asset_type, asset_info, cfg)
@@ -1031,6 +1267,8 @@ def _final_pass(main_input, main_start, main_end, thumb, asset_type, asset_info,
         asset_in_outro = ["-loop", "1", "-framerate", str(fps), "-t", str(outro), "-i", str(thumb)]
     cmd = ["ffmpeg", "-y"]
     cmd += asset_in
+    if hwaccel:
+        cmd += ["-hwaccel", "cuda"]
     cmd += ["-i", str(main_input)]
     cmd += asset_in_outro
     cmd += [
@@ -1052,8 +1290,10 @@ def _final_pass(main_input, main_start, main_end, thumb, asset_type, asset_info,
           f"想定 {expected:.1f}s)")
 
 
-def _render_legacy(plan, thumb, output, cfg, enc_args, progress_cb):
-    """従来方式: 無音カット時は中間ファイルを作ってから最終パス (2パス)。"""
+def _render_legacy(plan, thumb, output, cfg, enc_args, progress_cb,
+                   workdir=None, hwaccel=False):
+    """従来方式: 無音カット時は中間ファイルを作ってから最終パス (2パス)。
+    中間ファイル (本編カット) は workdir があればそこに作る。"""
     vinfo = plan["video"]
     video = Path(vinfo["path"])
     width, height, fps = vinfo["width"], vinfo["height"], vinfo["fps"]
@@ -1077,10 +1317,13 @@ def _render_legacy(plan, thumb, output, cfg, enc_args, progress_cb):
     # LLM / ユーザー) によらず本編カットを作る。以前は無音カット有効時の
     # みだったため、他方式のカットがフォールバック時に落ちていた。
     if not single:
-        tmp_cut = output.with_name(output.stem + "_maincut.mp4")
+        if workdir is not None:
+            tmp_cut = Path(workdir) / (output.stem + "_maincut.mp4")
+        else:
+            tmp_cut = output.with_name(output.stem + "_maincut.mp4")
         _build_main_cut(video, keeps, width, height, fps, tmp_cut,
                         max(10, crf - 3), preset, progress_cb, main_dur,
-                        dissolve=dissolve)
+                        dissolve=dissolve, workdir=workdir, hwaccel=hwaccel)
         main_input = tmp_cut
         main_start = 0.0
         main_end = float(probe(tmp_cut)["format"]["duration"])
@@ -1088,23 +1331,87 @@ def _render_legacy(plan, thumb, output, cfg, enc_args, progress_cb):
     try:
         _final_pass(main_input, main_start, main_end, thumb, asset_type, asset_info,
                     has_audio, width, height, fps, cfg, enc_args, output,
-                    progress_cb, base_pct, span_pct)
+                    progress_cb, base_pct, span_pct, hwaccel=hwaccel)
     finally:
         if tmp_cut:
             tmp_cut.unlink(missing_ok=True)
+
+
+def _resolve_workdir(cfg, output=None, need_bytes=0) -> Path:
+    """作業ディレクトリを決める: cfg "workdir" > 環境変数 EDIT_WORKDIR
+    > システムの一時領域。存在しなければ作る。
+
+    既定の一時領域が小さな tmpfs 等で、必要量 (need_bytes) を置く空きが
+    無い場合は、出力先の親ディレクトリにフォールバックする (断片は
+    元動画と同程度の容量になるため、置き場所の空き不足は致命的)。
+    明示指定 (cfg / 環境変数) がある場合はそのまま使う。"""
+    raw = cfg.get("workdir") or os.environ.get("EDIT_WORKDIR")
+    if raw:
+        wd = Path(raw)
+        wd.mkdir(parents=True, exist_ok=True)
+        return wd
+    tmp = Path(tempfile.gettempdir())
+
+    def _free(p):
+        try:
+            return shutil.disk_usage(p).free
+        except OSError:
+            return 0
+
+    if _free(tmp) >= need_bytes:
+        return tmp
+    if output is not None:
+        parent = Path(output).parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        if _free(parent) > _free(tmp):
+            _progress("一時領域の空きが不足するため、作業ファイルを出力先の"
+                      "フォルダに置きます")
+            return parent
+    return tmp
+
+
+def _is_other_fs(path, ref_dir) -> bool:
+    """path が ref_dir と別ファイルシステムにあるか (st_dev 比較)。
+    判定できない場合は安全側 (別FS扱い = コピーする) に倒す。"""
+    try:
+        return os.stat(path).st_dev != os.stat(ref_dir).st_dev
+    except OSError:
+        return True
+
+
+def _localize_input(path, job_tmp, tag) -> Path:
+    """入力が作業領域と別FS (Google Drive の FUSE 等) にあれば job_tmp へ
+    1回だけコピーしてローカルパスを返す。同一FSならそのまま返す。
+    断片レンダーごとに低速なリモートファイルへ繰り返しアクセスするのを
+    避けるための寄せ処理。"""
+    path = Path(path)
+    if not _is_other_fs(path, job_tmp):
+        return path
+    dest = job_tmp / f"{tag}{path.suffix}"
+    _progress(f"入力を作業領域にコピーしています: {path.name}")
+    shutil.copy2(path, dest)
+    return dest
 
 
 def render_plan(plan: dict, output: Path, cfg: dict = None, thumb=None, progress_cb=None):
     """カット案 dict から最終書き出しを行う。
 
     cfg で上書きできるのは表示・品質系 (dissolve, intro_sec, outro_sec,
-    asset_type, crf, preset, encoder, one_pass) のみ。開始点・保持区間は
-    plan 側が正。
+    asset_type, crf, preset, encoder, one_pass, workdir, hwaccel) のみ。
+    開始点・保持区間は plan 側が正。
+
+    中間ファイルは作業ディレクトリ (cfg "workdir" / 環境変数
+    EDIT_WORKDIR / 既定は一時領域) の下に作り、終わったら消す。
+    入力が別FSにある場合は作業ディレクトリへ寄せてから処理する。
     """
     cfg = dict(cfg or {})
     eff = dict(plan.get("render") or {})
     for key in ("dissolve", "intro_sec", "outro_sec", "asset_type",
-                "crf", "preset", "encoder", "nvenc_cq", "nvenc_preset", "one_pass"):
+                "crf", "preset", "encoder", "nvenc_cq", "nvenc_preset",
+                "one_pass", "workdir", "hwaccel"):
         if cfg.get(key) is not None:
             eff[key] = cfg[key]
     if thumb is None and plan.get("asset"):
@@ -1116,20 +1423,54 @@ def render_plan(plan: dict, output: Path, cfg: dict = None, thumb=None, progress
 
     enc_args, enc_name = _encoder_args(eff)
     print(f"  エンコーダ: {enc_name}")
-    if eff.get("one_pass", True):
-        keeps = [tuple(k) for k in (plan.get("silence") or {}).get("keeps") or []]
-        if keeps and _needs_smart_render(keeps):
-            # 1パス方式は全区間を1グラフでつなぐため、区間が多いと
-            # メモリを使い切って ffmpeg が kill される。最初から
-            # メモリ安全な従来方式 (分割方式の本編カット + 最終パス) を使う。
-            print("  保持区間が多いため、メモリ安全な従来方式 (2パス) で書き出します")
-        else:
-            try:
-                _render_one_pass(plan, thumb, output, eff, enc_args, progress_cb)
-                return
-            except RuntimeError as e:
-                print(f"  1パス書き出しに失敗したため従来方式 (2パス) にフォールバックします: {e}")
-    _render_legacy(plan, thumb, output, eff, enc_args, progress_cb)
+    hwaccel = (str(eff.get("hwaccel", "")).lower() == "cuda"
+               and enc_name == "h264_nvenc")
+    if eff.get("hwaccel") and not hwaccel:
+        print("  hwaccel: NVENC 使用時のみ有効なため今回は使いません")
+
+    # 断片は元動画と同程度の容量になる。作業領域の空き判定に使う
+    need_bytes = 0
+    for p in (plan["video"]["path"], thumb):
+        try:
+            need_bytes += os.path.getsize(p)
+        except OSError:
+            pass
+    need_bytes = max(512 * 1024 * 1024, int(need_bytes * 1.5))
+    workdir = _resolve_workdir(eff, output=output, need_bytes=need_bytes)
+    job_tmp = Path(tempfile.mkdtemp(prefix="edit_render_", dir=str(workdir)))
+    try:
+        local_video = _localize_input(plan["video"]["path"], job_tmp,
+                                      "input_video")
+        local_thumb = _localize_input(thumb, job_tmp, "input_asset")
+        plan2 = dict(plan)
+        plan2["video"] = dict(plan["video"])
+        plan2["video"]["path"] = str(local_video)
+
+        if eff.get("one_pass", True):
+            keeps = [tuple(k) for k
+                     in (plan2.get("silence") or {}).get("keeps") or []]
+            if keeps and _needs_smart_render(keeps):
+                # 1パス方式は全区間を1グラフでつなぐため、区間が多いと
+                # メモリを使い切って ffmpeg が kill される。メモリ安全な
+                # 統合分割方式 (OP/ED込みの断片計画 + concat) を使う。
+                _progress("保持区間が多いため、メモリ安全な統合分割方式で書き出します")
+                try:
+                    _build_unified(plan2, local_thumb, output, eff, enc_args,
+                                   progress_cb, job_tmp, hwaccel=hwaccel)
+                    return
+                except RuntimeError as e:
+                    print(f"  統合分割方式に失敗したため従来方式 (2パス) にフォールバックします: {e}")
+            else:
+                try:
+                    _render_one_pass(plan2, local_thumb, output, eff, enc_args,
+                                     progress_cb, hwaccel=hwaccel)
+                    return
+                except RuntimeError as e:
+                    print(f"  1パス書き出しに失敗したため従来方式 (2パス) にフォールバックします: {e}")
+        _render_legacy(plan2, local_thumb, output, eff, enc_args, progress_cb,
+                       workdir=job_tmp, hwaccel=hwaccel)
+    finally:
+        shutil.rmtree(job_tmp, ignore_errors=True)
 
 
 def build_and_run(input_video: Path, thumb: Path, output: Path, cfg: dict, progress_cb=None):
@@ -1254,6 +1595,8 @@ def _render_cli(argv):
     ap.add_argument("--encoder", choices=["auto", "x264", "nvenc"], help="エンコーダ (既定auto)")
     ap.add_argument("--crf", type=int, help="libx264 の crf")
     ap.add_argument("--preset", help="libx264 の preset")
+    ap.add_argument("--workdir", help="中間ファイル用の作業ディレクトリ (既定: 環境変数 EDIT_WORKDIR か一時領域)")
+    ap.add_argument("--hwaccel", action="store_true", help="NVENC使用時に入力デコードへ -hwaccel cuda を付ける")
     ap.add_argument("--two-pass", action="store_true", help="従来の2パス方式で書き出す")
     args = ap.parse_args(argv)
 
@@ -1262,7 +1605,9 @@ def _render_cli(argv):
     _overlay(cfg, [("dissolve", args.dissolve), ("intro_sec", args.intro_sec),
                    ("outro_sec", args.outro_sec), ("asset_type", args.asset_type),
                    ("encoder", args.encoder), ("crf", args.crf),
-                   ("preset", args.preset)])
+                   ("preset", args.preset), ("workdir", args.workdir)])
+    if args.hwaccel:
+        cfg["hwaccel"] = "cuda"
     if args.two_pass:
         cfg["one_pass"] = False
     if args.output:
